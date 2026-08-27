@@ -1,0 +1,83 @@
+# helm/backend/values.yaml — the control panel of the backend service.
+# Values marked (deploy.sh) are injected from Terraform outputs at install.
+
+image:
+  registry: ""                  # (deploy.sh) e.g. 123456789.dkr.ecr.us-east-1.amazonaws.com
+  repository: vm-order-backend
+  tag: "1.0.0"                  # pinned — never latest
+
+replicas: 2                     # baseline; HPA takes over from here
+
+serviceAccount:
+  name: backend-sa
+  roleArn: ""                   # (deploy.sh) IRSA role ARN — keyless AWS access
+
+service:
+  port: 5000
+
+resources:
+  requests:                     # baseline for HPA percentage math
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 256Mi
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 5
+  targetCPU: 70                 # % of requested CPU
+
+config:                         # non-secret config → ConfigMap
+  AWS_REGION: us-east-1         # (deploy.sh)
+  DB_PORT: "5432"
+  DB_USER: vmadmin
+  DB_NAME: vmorders
+  S3_BUCKET: ""                 # (deploy.sh)
+  WORKER_URL: http://worker:5001   # K8s Service DNS — no IPs! (code appends /notify itself)
+  PYTHONDONTWRITEBYTECODE: "1"  # nothing tries to write into the read-only image
+
+# REVIEW FIX 2.2 — was the shared "app-secrets". One Secret per workload:
+# DB_HOST + DB_PASSWORD only — the backend never calls SNS or SES.
+existingSecret: backend-secrets   # created by scripts/install-jenkins.sh, NOT by Helm
+
+networkPolicy:
+  enabled: true
+  vpcCidr: 10.23.0.0/16         # RDS lives inside the VPC
+  # REVIEW FIX 4.6 — 5432 egress is allowed only to the DB subnets, not the
+  # whole VPC. Overridden per environment by Jenkinsfile-cd from
+  # `terraform output db_subnet_cidrs`; these are the defaults.
+  dbSubnetCidrs:
+    - 10.23.2.0/24
+    - 10.23.3.0/24
+
+# --- Phase 5: observability --------------------------------------------------
+monitoring:
+  # Guarded by a flag, and that is not decoration. A ServiceMonitor is a custom
+  # resource: on a cluster where the Prometheus Operator is not installed the
+  # CRD does not exist and `helm install` fails outright. A chart that cannot
+  # be installed without the monitoring stack is a chart that cannot be tested
+  # in isolation, so this defaults to on for the real deploy and can be turned
+  # off for a bare cluster.
+  enabled: true
+  # Scraped every 30s, matching the Prometheus global interval. Setting a
+  # DIFFERENT interval here is a classic way to make rate() lie: a 30s range
+  # over a 60s scrape has at most one sample and silently returns nothing.
+  interval: 30s
+  scrapeTimeout: 10s
+  # The namespace the scraper lives in. Used by the NetworkPolicy below to
+  # admit Prometheus to the metrics port and nothing else.
+  namespace: observability
+
+metricsPort: 9090          # NEVER 5000 - the probes own that one
+
+# Build identity, surfaced as app_build_info{version,git_sha,release}.
+# Jenkinsfile-cd overrides all three from the tag and commit it is deploying,
+# which is what lets a dashboard annotate a latency change with the release
+# that caused it and lets the CD gate assert the running pods report THIS
+# commit. Defaults are honest placeholders, never a fake version.
+build:
+  version: ""
+  gitSha: ""
+  release: ""

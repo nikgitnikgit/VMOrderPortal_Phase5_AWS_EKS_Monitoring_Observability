@@ -1,0 +1,43 @@
+{{- if .Values.monitoring.enabled }}
+# A ServiceMonitor is a SELECTOR, not a scrape job. The Prometheus Operator
+# watches these objects, finds the Services whose labels match, resolves them
+# to Endpoints (the individual pod IPs behind the Service), and writes the
+# resulting scrape config into Prometheus's Secret. Prometheus then scrapes
+# each POD directly - not through the Service's load balancing, which would
+# hit a different replica each time and make per-pod metrics meaningless.
+#
+# It lives in this chart rather than in the observability chart on purpose: an
+# alert about the backend belongs to the backend, and is deployed and rolled back by
+# the same CD run that deployed the code it describes.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: backend
+  labels:
+    app: backend
+    # No 'release' label needed: helm/observability sets
+    # serviceMonitorSelectorNilUsesHelmValues=false, so Prometheus discovers
+    # every ServiceMonitor in every namespace instead of only those tagged with
+    # its own release name. Without that setting this object would be created
+    # successfully, matched correctly, and simply never looked at.
+spec:
+  namespaceSelector:
+    matchNames: [{{ .Release.Namespace }}]
+  selector:
+    matchLabels:
+      app: backend
+  endpoints:
+    - port: metrics          # the NAMED port on the Service
+      path: /metrics
+      interval: {{ .Values.monitoring.interval }}
+      scrapeTimeout: {{ .Values.monitoring.scrapeTimeout }}
+      # Relabelling is where cardinality is won or lost. The operator adds a
+      # pile of discovery labels by default; these two are the ones dashboards
+      # actually group by, and naming them explicitly means a future operator
+      # version cannot quietly change what the series look like.
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+{{- end }}

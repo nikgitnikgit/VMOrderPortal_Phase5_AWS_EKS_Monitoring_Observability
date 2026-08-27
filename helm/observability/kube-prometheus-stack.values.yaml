@@ -1,0 +1,428 @@
+# helm/observability/kube-prometheus-stack.values.yaml
+#
+# Values for the UPSTREAM kube-prometheus-stack chart. Applied by
+# scripts/install-observability.sh, which pins the chart version from
+# helm/observability/CHART_VERSION — the same arrangement as
+# jenkins/values.yaml + jenkins/CHART_VERSION.
+#
+# Environment-specific values (the Alertmanager IRSA role ARN, the SNS topic,
+# the region, the certificate ARN, your IP) are NOT here. They are generated at
+# install time from Terraform outputs, so this file is safe to commit and a
+# second contributor needs no edits.
+
+# =============================================================================
+# What is switched OFF, and why that is the most important block in this file
+# =============================================================================
+#
+# On EKS the control plane is AWS-managed and simply not reachable from inside
+# the cluster. The chart's defaults assume a self-managed cluster and create
+# scrape targets for components that do not exist here. Left enabled, four
+# targets sit DOWN forever.
+#
+# That is not cosmetic. It means:
+#   * PrometheusTargetDown fires permanently and becomes background noise, so
+#     the one alert whose job is to tell you a target died gets ignored;
+#   * "all targets up" stops being provable, which is the evidence the CD gate
+#     and the defence both rest on.
+#
+# kube-proxy is a slightly different case: it exists on EKS, but its metrics
+# bind to 127.0.0.1:10249 by default, so the scrape fails for the same visible
+# reason. Enable it only after patching the kube-proxy ConfigMap to
+# metricsBindAddress: 0.0.0.0.
+kubeControllerManager: { enabled: false }
+kubeScheduler:         { enabled: false }
+kubeEtcd:              { enabled: false }
+kubeProxy:             { enabled: false }
+
+defaultRules:
+  create: true
+  rules:
+    # The rule groups that alert on the components disabled above. Leaving them
+    # on would produce alerts about absent metrics — which fire, and which
+    # nobody can act on.
+    kubeControllerManager: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    etcd: false
+    kubeProxy: false
+
+# =============================================================================
+# Prometheus
+# =============================================================================
+prometheus:
+  prometheusSpec:
+    retention: 15d
+    # Below the volume size, and that is deliberate. retentionSize is a soft
+    # ceiling enforced by deleting whole blocks; set it equal to or above the
+    # PVC and Prometheus fills the disk and wedges, which is a genuinely
+    # unpleasant recovery. 7GB on 10Gi leaves room for the head block and for
+    # a compaction that writes the merged block before deleting its sources.
+    retentionSize: 7GB
+    scrapeInterval: 30s
+    evaluationInterval: 30s
+
+    # THE SETTING THAT MAKES EVERYTHING ELSE WORK.
+    #
+    # By default Prometheus only discovers monitors labelled with its own Helm
+    # release name. Our ServiceMonitors ship inside the application charts and
+    # carry no such label, so with the default they would be created
+    # successfully, be perfectly valid, and never be looked at — no error
+    # anywhere, just an empty dashboard. Setting these to false means "select
+    # everything" instead of "select nothing but my own release".
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    probeSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+
+    # Admin API stays OFF. It exposes /api/v1/admin/tsdb/delete_series, which
+    # deletes data with no authentication in front of it. Prometheus has no
+    # login of its own; the only thing protecting it is that nothing can reach
+    # it, and the only thing that keeps THAT true is that it has no Ingress.
+    enableAdminAPI: false
+
+    # An external label, so a future second cluster's data is distinguishable
+    # if these ever land in the same store. Cheap now, impossible to backfill.
+    externalLabels:
+      cluster: vm-order
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              # Sized from arithmetic, not habit: ~21k active series at a 30s
+              # scrape over 15 days is 907M samples, which Prometheus stores in
+              # 1.4–1.9 GB. Index churn from ephemeral CI agent pods and
+              # compaction headroom take the realistic total to 3–5 GB. 10Gi is
+              # 2–3x that. See docs/PHASE5_PLAN.md §3.2.
+              storage: 10Gi
+
+    resources:
+      requests: { cpu: 200m, memory: 1Gi }
+      limits:   { cpu: "1",  memory: 2Gi }
+
+    # The monitoring node, and only the monitoring node.
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: PLACEHOLDER_MONITORING_NODEGROUP
+    tolerations:
+      - key: role
+        operator: Equal
+        value: monitoring
+        effect: NoSchedule
+
+    securityContext:
+      runAsNonRoot: true
+      runAsUser: 1000
+      fsGroup: 2000
+      seccompProfile:
+        type: RuntimeDefault
+
+  # NO INGRESS. Prometheus has no authentication of any kind: there is no login
+  # page to put behind an ALB. Exposing it would serve every metric — including
+  # the AWS account ID embedded in ECR image labels, which
+  # scripts/collect-ci-evidence.sh strips out of the evidence pack on purpose —
+  # and would let anyone run a PromQL query heavy enough to OOM it.
+  #
+  # Reached with: ./scripts/port-forward-monitoring.sh
+  ingress:
+    enabled: false
+  service:
+    type: ClusterIP
+
+# =============================================================================
+# Alertmanager
+# =============================================================================
+alertmanager:
+  alertmanagerSpec:
+    # 1Gi is not a capacity decision — Alertmanager stores the notification log
+    # and silences, both of which are kilobytes. It is the EBS minimum. The
+    # volume exists so that a silence you set for a maintenance window survives
+    # a pod restart, and so a restart does not re-send every notification.
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: gp3
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 1Gi
+
+    resources:
+      requests: { cpu: 25m, memory: 64Mi }
+      limits:   { cpu: 200m, memory: 256Mi }
+
+    nodeSelector:
+      eks.amazonaws.com/nodegroup: PLACEHOLDER_MONITORING_NODEGROUP
+    tolerations:
+      - key: role
+        operator: Equal
+        value: monitoring
+        effect: NoSchedule
+
+  # PINNED, not derived from the release name. The IRSA trust policy in
+  # terraform/modules/irsa names this ServiceAccount exactly. If the chart
+  # derived it and someone renamed the release, the pod would start, the trust
+  # condition would no longer match, every publish would fail with AccessDenied
+  # — and Alertmanager does not fail loudly when a receiver cannot deliver.
+  serviceAccount:
+    create: true
+    name: alertmanager
+    annotations:
+      eks.amazonaws.com/role-arn: PLACEHOLDER_ALERTMANAGER_ROLE_ARN
+
+  ingress:
+    enabled: false
+
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      # Group by the two labels that decide whether two alerts are the same
+      # incident. Grouping by pod as well would page once per replica.
+      group_by: ["alertname", "namespace"]
+      group_wait: 30s
+      group_interval: 5m
+      # 4h, not the 12h default. A 12-hour repeat on a critical alert means an
+      # incident that starts at 21:00 is silent until morning.
+      repeat_interval: 4h
+      receiver: sns
+      routes:
+        # The chart's own always-firing heartbeat. It exists to prove the
+        # pipeline works end to end, and it must not reach the inbox.
+        - matchers: ["alertname = Watchdog"]
+          receiver: "null"
+    inhibit_rules:
+      # A critical and a warning about the same thing in the same namespace is
+      # one problem. Send the critical; suppress the warning.
+      - source_matchers: ["severity = critical"]
+        target_matchers: ["severity = warning"]
+        equal: ["alertname", "namespace"]
+    receivers:
+      - name: "null"
+      - name: sns
+        sns_configs:
+          - topic_arn: PLACEHOLDER_SNS_TOPIC_ARN
+            sigv4:
+              # region only, no access_key/secret_key. Blank credentials mean
+              # the AWS SDK falls back to its default chain, which on EKS is
+              # the IRSA web identity token projected into the pod. That is the
+              # whole point: no key, no SMTP password, no secret in Git.
+              region: PLACEHOLDER_AWS_REGION
+            # `subject` and `message` are DELIBERATELY ABSENT.
+            #
+            # AUDIT FIX. They used to be set explicitly to
+            #   '{{ template "sns.default.subject" . }}'
+            # which is exactly what Alertmanager already uses when they are
+            # omitted -- so they added nothing, and they carried a real risk:
+            # this whole block is a Helm VALUES file, and the chart can render
+            # alertmanager.config through Helm's `tpl` function. When it does,
+            # Helm evaluates `{{ template "sns.default.subject" . }}` itself,
+            # finds no Helm template by that name, and aborts the install with
+            # an error that points at a values file rather than at a template.
+            #
+            # Two template languages sharing one delimiter is a trap you do not
+            # step around, you step out of: omitting the keys gives byte-
+            # identical notifications and cannot break either way.
+            send_resolved: true
+    templates: []
+
+# =============================================================================
+# Grafana
+# =============================================================================
+grafana:
+  enabled: true
+
+  # NO PERSISTENCE, ON PURPOSE.
+  #
+  # This is a feature, not a saving. With no database, a dashboard edited in
+  # the UI dies at the next pod restart — which ENFORCES "observability as
+  # code" instead of merely asking for it, and makes it demonstrable in one
+  # command: edit a panel, delete the pod, watch Git win.
+  persistence:
+    enabled: false
+
+  # Created by scripts/install-observability.sh from a generated password and
+  # printed once. Never committed.
+  admin:
+    existingSecret: grafana-admin
+    userKey: admin-user
+    passwordKey: admin-password
+
+  # Anonymous access off, sign-up off. The ALB in front of this is restricted
+  # to one IP, but IP allowlisting is not authentication and must not be the
+  # only thing between the internet and the dashboards.
+  grafana.ini:
+    auth.anonymous:
+      enabled: false
+    users:
+      allow_sign_up: false
+    security:
+      cookie_secure: true
+      # The ALB terminates TLS and forwards HTTP, so Grafana must be told what
+      # the browser actually used or every generated link comes out as http://
+      # and the redirect loop that follows looks like a login failure.
+      cookie_samesite: lax
+    server:
+      root_url: "%(protocol)s://%(domain)s/"
+
+  sidecar:
+    dashboards:
+      enabled: true
+      # Watch every namespace, not just Grafana's own. Ours live in the same
+      # namespace today; this means a future per-service dashboard shipped in
+      # an application chart is picked up without another values change.
+      searchNamespace: ALL
+      label: grafana_dashboard
+      labelValue: "1"
+      folderAnnotation: grafana_folder
+      provider:
+        # false: dashboards from ConfigMaps cannot be overwritten by UI edits
+        # in a way that survives. Belt and braces with persistence off.
+        allowUiUpdates: false
+        foldersFromFilesStructure: true
+    datasources:
+      # OFF, and this is the fix for a startup crash rather than a preference.
+      #
+      # AUDIT FIX. With this enabled, kube-prometheus-stack generates its OWN
+      # datasource ConfigMap for the sidecar to collect -- named "Prometheus",
+      # with isDefault: true. The block below provisions a datasource named
+      # "Prometheus" with isDefault: true as well. Grafana validates
+      # provisioning at startup and refuses to run with two:
+      #
+      #   Datasource provisioning error: datasource.yaml config is invalid.
+      #   Only one datasource per organization can be marked as default
+      #
+      # That is a CrashLoopBackOff, not a warning, and the message says nothing
+      # about a Helm chart having quietly added a second one.
+      #
+      # Ours is the one that must survive: the chart's generated datasource has
+      # no fixed uid, and every panel in dashboards/*.json references
+      # uid "prometheus" by name. Keeping the chart's copy instead would leave
+      # the dashboards rendering "Datasource not found" on every panel.
+      enabled: false
+
+  # Provisioned by value, so there is no UI step and no manual datasource.
+  # The uid is FIXED and every panel in grafana/dashboards/*.json references
+  # it: a generated uid would differ per install and every panel would render
+  # "Datasource not found", which looks like a broken Prometheus.
+  additionalDataSources: []
+  datasources:
+    datasources.yaml:
+      apiVersion: 1
+      datasources:
+        - name: Prometheus
+          uid: prometheus
+          type: prometheus
+          access: proxy
+          url: http://kube-prometheus-stack-prometheus.observability.svc:9090
+          isDefault: true
+          jsonData:
+            timeInterval: 30s
+
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { cpu: 300m, memory: 384Mi }
+
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: PLACEHOLDER_MONITORING_NODEGROUP
+  tolerations:
+    - key: role
+      operator: Equal
+      value: monitoring
+      effect: NoSchedule
+
+  service:
+    type: ClusterIP
+    port: 80
+
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    # MUST be Prefix. ImplementationSpecific lets the ALB controller treat "/"
+    # as an EXACT match, so the root URL works and every asset, /login and
+    # /d/<uid> return a bare 404 from the ALB before reaching Grafana. This
+    # exact trap cost a debugging session on the Jenkins ingress in phase 4.
+    pathType: Prefix
+    path: /
+    hosts: []
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/healthcheck-path: /api/health
+      # Overwritten at install time from Terraform outputs and your current
+      # public IP. If these placeholders ever reach a running cluster,
+      # scripts/verify-observability.sh fails.
+      alb.ingress.kubernetes.io/inbound-cidrs: PLACEHOLDER_OPERATOR_CIDRS
+      alb.ingress.kubernetes.io/certificate-arn: PLACEHOLDER_GRAFANA_CERT_ARN
+      alb.ingress.kubernetes.io/listen-ports: '[{"HTTP": 80}, {"HTTPS": 443}]'
+      alb.ingress.kubernetes.io/ssl-redirect: "443"
+      alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+# =============================================================================
+# kube-state-metrics — object state: replicas, restarts, rollouts, PVC usage
+# =============================================================================
+kube-state-metrics:
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: PLACEHOLDER_MONITORING_NODEGROUP
+  tolerations:
+    - key: role
+      operator: Equal
+      value: monitoring
+      effect: NoSchedule
+  resources:
+    requests: { cpu: 20m, memory: 64Mi }
+    limits:   { cpu: 200m, memory: 256Mi }
+
+# =============================================================================
+# node-exporter — the one component that must run EVERYWHERE
+# =============================================================================
+prometheus-node-exporter:
+  # THE TRAP: the default tolerations do not include role=jenkins or
+  # role=monitoring. The DaemonSet comes up, reports Ready, logs no error —
+  # and simply has no data for the two tainted nodes. You find out when a node
+  # runs out of memory and the dashboard shows a flat line.
+  #
+  # `operator: Exists` with no key tolerates EVERY taint, which for a
+  # node-level exporter is correct: a node it cannot run on is a node with no
+  # metrics. tests/check_observability_values.py asserts this stays true.
+  tolerations:
+    - operator: Exists
+  resources:
+    requests: { cpu: 10m, memory: 32Mi }
+    limits:   { cpu: 100m, memory: 64Mi }
+
+# =============================================================================
+# Prometheus Operator
+# =============================================================================
+prometheusOperator:
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: PLACEHOLDER_MONITORING_NODEGROUP
+  tolerations:
+    - key: role
+      operator: Equal
+      value: monitoring
+      effect: NoSchedule
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { cpu: 300m, memory: 384Mi }
+  # CRDs are applied server-side by scripts/install-observability.sh BEFORE the
+  # release, and never by Helm. Helm installs CRDs once and then never upgrades
+  # them, and these are too large for a client-side apply — the
+  # last-applied-configuration annotation exceeds 262144 bytes. Letting Helm
+  # own them means the first chart upgrade fails with schema errors that read
+  # like values errors.
+  admissionWebhooks:
+    patch:
+      nodeSelector:
+        eks.amazonaws.com/nodegroup: PLACEHOLDER_MONITORING_NODEGROUP
+      tolerations:
+        - key: role
+          operator: Equal
+          value: monitoring
+          effect: NoSchedule
+
+crds:
+  enabled: false

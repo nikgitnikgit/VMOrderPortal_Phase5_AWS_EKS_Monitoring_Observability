@@ -1,0 +1,173 @@
+# jenkins/networkpolicy.yaml — network isolation for the jenkins namespace
+#
+# Jenkins is the most dangerous workload in the cluster: it runs arbitrary
+# code by design. These policies limit what it can reach if it is compromised.
+#
+# NOTE: this file is a TEMPLATE. install-jenkins.sh substitutes __VPC_CIDR__
+# with the real value from `terraform output vpc_cidr` before applying it.
+# It was previously hardcoded to 10.0.0.0/16, which silently blocked all ALB
+# traffic on a cluster using a different range — the policies applied cleanly,
+# the pods were healthy, and every request timed out with a 504.
+#
+# Requires a CNI that enforces NetworkPolicy. On EKS the AWS VPC CNI does so
+# only when ENABLE_NETWORK_POLICY=true is set on the aws-node DaemonSet;
+# install-jenkins.sh enables it and verify-jenkins.sh checks it. If the flag
+# cannot be enabled, these objects are still created (they are valid API
+# objects) but are not enforced — README documents that caveat honestly
+# rather than claiming protection that is not active.
+
+---
+# Default deny: nothing in or out unless a policy below allows it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: jenkins
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+
+---
+# Controller: reachable from the ALB (VPC sources) on the UI port, and from
+# agent pods on the JNLP port.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jenkins-controller
+  namespace: jenkins
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: jenkins-controller
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # ALB targets pod IPs directly; its traffic originates inside the VPC.
+    - from:
+        - ipBlock:
+            cidr: __VPC_CIDR__
+      ports:
+        - port: 8080
+    # Agents connect back over JNLP.
+    - from:
+        - podSelector:
+            matchLabels:
+              jenkins/agent: "true"
+      ports:
+        - port: 50000
+        - port: 8080
+    # Phase 5: Prometheus scrapes /prometheus on the controller's HTTP port.
+    # The endpoint is served by the Jenkins Prometheus plugin on the SAME port
+    # as the UI, so this rule cannot be narrowed to a metrics-only port the way
+    # the application ones are. What bounds it instead is the source: one
+    # namespace, selected by label, and nothing else in the cluster.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - port: 8080
+  egress:
+    # Kubernetes API — to create and delete agent pods.
+    - to:
+        - ipBlock:
+            cidr: __VPC_CIDR__
+      ports:
+        - port: 443
+    # DNS.
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Internet: plugin downloads (updates.jenkins.io) over HTTPS.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32   # block the instance metadata endpoint
+      ports:
+        - port: 443
+
+---
+# Agents: outbound to GitHub, ECR, the Kubernetes API and AWS APIs;
+# inbound from nothing.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: jenkins-agents
+  namespace: jenkins
+spec:
+  podSelector:
+    matchLabels:
+      jenkins/agent: "true"
+  policyTypes:
+    - Ingress
+    - Egress
+  # No ingress rules at all: nothing may initiate a connection to a build pod.
+  egress:
+    - to:
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Jenkins controller (JNLP + REST).
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: jenkins-controller
+      ports:
+        - port: 50000
+        - port: 8080
+    # In-cluster targets the CD smoke test needs: the frontend Service.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: devops-app
+      ports:
+        - port: 8080
+    # Phase 5: the CD monitoring gate queries the Prometheus HTTP API.
+    #
+    # Without this rule the gate does not fail loudly - it times out, and a
+    # timeout inside a retry loop is exactly the shape that turns a gate into
+    # decoration. The gate treats an unreachable Prometheus as FAILURE for that
+    # reason, but the rule is what makes the normal case work.
+    #
+    # Egress only. Nothing in the observability namespace may open a connection
+    # to a build pod, and the agents policy still declares no ingress at all.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: observability
+      ports:
+        - port: 9090
+    # Kubernetes API server and AWS service endpoints inside the VPC.
+    - to:
+        - ipBlock:
+            cidr: __VPC_CIDR__
+      ports:
+        - port: 443
+    # Internet over HTTPS: GitHub clone, ECR push, Trivy DB, package mirrors.
+    # The instance metadata endpoint is excluded so a malicious build cannot
+    # steal the NODE role credentials and bypass IRSA.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+      ports:
+        - port: 443
+        - port: 80

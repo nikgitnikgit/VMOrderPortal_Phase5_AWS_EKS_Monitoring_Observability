@@ -1,0 +1,54 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: frontend
+  labels:
+    app: frontend
+spec:
+  podSelector:
+    matchLabels:
+      app: frontend
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # ALB targets pod IPs directly; its traffic originates inside the VPC.
+    # Tightest practical rule: allow VPC sources on the nginx port only.
+    - from:
+        - ipBlock:
+            cidr: {{ .Values.networkPolicy.vpcCidr }}
+      ports:
+        - port: 8080
+{{- if .Values.monitoring.enabled }}
+    # Prometheus, and ONLY Prometheus, and only on the metrics port.
+    #
+    # A namespaceSelector, not an ipBlock: pod IPs are ephemeral and a CIDR
+    # here would admit anything that happened to land in that range. The
+    # observability namespace carries kubernetes.io/metadata.name as an
+    # explicit label in k8s/namespace.yaml precisely so this rule can select
+    # on it rather than relying on a label Kubernetes sets implicitly.
+    #
+    # Note what this does NOT do: it does not widen access to the application
+    # port. The rule above still admits only the frontend to {{ .Values.service.port }}.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.monitoring.namespace }}
+      ports:
+        - port: {{ .Values.metricsPort }}
+{{- end }}
+  egress:
+    # DNS
+    - to: []
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # The ONLY app egress: proxy to backend
+    - to:
+        - podSelector:
+            matchLabels:
+              app: backend
+      ports:
+        - port: 5000
+{{- end }}

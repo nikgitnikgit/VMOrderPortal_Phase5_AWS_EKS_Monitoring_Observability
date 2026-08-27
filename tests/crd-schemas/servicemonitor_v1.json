@@ -1,0 +1,132 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "monitoring.coreos.com/v1"
+    },
+    "kind": {
+      "const": "ServiceMonitor"
+    },
+    "metadata": {
+      "type": "object"
+    },
+    "spec": {
+      "type": "object",
+      "required": [
+        "selector",
+        "endpoints"
+      ],
+      "properties": {
+        "selector": {
+          "type": "object",
+          "properties": {
+            "matchLabels": {
+              "type": "object"
+            },
+            "matchExpressions": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "namespaceSelector": {
+          "type": "object",
+          "properties": {
+            "any": {
+              "type": "boolean"
+            },
+            "matchNames": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "endpoints": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "properties": {
+              "port": {
+                "type": "string"
+              },
+              "targetPort": {},
+              "path": {
+                "type": "string"
+              },
+              "interval": {
+                "type": "string"
+              },
+              "scrapeTimeout": {
+                "type": "string"
+              },
+              "scheme": {
+                "type": "string"
+              },
+              "honorLabels": {
+                "type": "boolean"
+              },
+              "relabelings": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                }
+              },
+              "metricRelabelings": {
+                "type": "array",
+                "items": {
+                  "type": "object"
+                }
+              },
+              "authorization": {
+                "type": "object"
+              },
+              "bearerTokenSecret": {
+                "type": "object"
+              },
+              "tlsConfig": {
+                "type": "object"
+              },
+              "params": {
+                "type": "object"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "jobLabel": {
+          "type": "string"
+        },
+        "targetLabels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "podTargetLabels": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "sampleLimit": {
+          "type": "integer"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

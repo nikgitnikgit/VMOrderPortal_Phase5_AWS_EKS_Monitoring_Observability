@@ -1,0 +1,79 @@
+# helm/observability/values.yaml — OUR objects, not the upstream stack's.
+#
+# WHY THIS IS TWO THINGS AND NOT ONE UMBRELLA CHART
+#
+# kube-prometheus-stack is installed by scripts/install-observability.sh with
+# helm/observability/kube-prometheus-stack.values.yaml, exactly the way
+# install-jenkins.sh installs the Jenkins chart with jenkins/values.yaml and a
+# pinned jenkins/CHART_VERSION. This chart holds only the objects we author.
+#
+# An umbrella chart with kube-prometheus-stack as a dependency was the obvious
+# alternative and was rejected for one concrete reason: `helm template` on an
+# umbrella chart needs the dependency present, so it needs network access to
+# the upstream repository. That would make our own manifests unrenderable in
+# CI validation and in the offline test suite -- the two places that are
+# supposed to catch a broken dashboard or a malformed rule before it reaches a
+# cluster. Splitting them means every object we wrote can be rendered,
+# schema-validated and unit-tested with no network at all.
+
+namespace: observability
+
+# The Prometheus Service the CD gate and Grafana talk to. Derived from the
+# release name of the upstream chart, so it is a value rather than a guess.
+prometheus:
+  serviceName: kube-prometheus-stack-prometheus
+  port: 9090
+
+# Grafana discovers dashboards by watching ConfigMaps carrying this label. The
+# label and its value are fixed by the sidecar's configuration in
+# kube-prometheus-stack.values.yaml; changing one without the other means the
+# dashboards are created, are perfectly valid, and are never loaded.
+grafana:
+  dashboardLabel: grafana_dashboard
+  dashboardLabelValue: "1"
+  # Must match the datasource uid in kube-prometheus-stack.values.yaml AND the
+  # uid every panel references in grafana/dashboards/*.json. A mismatch renders
+  # every panel as "Datasource not found", which looks like a broken Prometheus
+  # rather than a typo.
+  datasourceUid: prometheus
+
+# Where the runbooks live, as a URL an on-call person can open from an alert.
+#
+# ONE place, not eleven. Every alert's runbook_url is built from this, because
+# the previous arrangement hardcoded the full URL in each of the eleven
+# annotations and they had drifted to a repository name that does not match
+# this project at all -- every link in every alert pointed somewhere wrong.
+#
+# Nothing offline can prove a URL resolves; T18.6 only proves the .md file
+# exists in this repository. So the failure mode is a link that 404s during an
+# incident, which is the moment it is least welcome. Deriving all eleven from
+# one value at least means checking it is a single thing to check, and changing
+# it after a rename is a single line.
+runbookBaseUrl: "https://github.com/nikgitnikgit/VMOrderPortal_Phase5_AWS_EKS_Monitoring_Observability/blob/main/docs/runbooks"
+
+# Namespaces whose targets the platform alerts watch.
+targetNamespaces:
+  - devops-app
+  - jenkins
+  - observability
+
+app:
+  namespace: devops-app
+
+jenkins:
+  namespace: jenkins
+  # The Jenkins controller Service, created by the Jenkins chart.
+  serviceName: jenkins
+  port: 8080
+  # Matches unclassified.prometheusConfiguration.path in jenkins/values.yaml.
+  path: /prometheus
+
+# --- SLO ---------------------------------------------------------------------
+# One place. The recording rules, the alerts, the dashboard panels and the CD
+# monitoring gate all evaluate the SAME expressions, built from these numbers.
+# Three drifting copies of a threshold is how a gate ends up passing traffic an
+# alert is simultaneously firing about.
+slo:
+  availabilityTarget: 0.99      # 99% of requests succeed
+  latencyP95Seconds: 0.5        # 95% under 500 ms
+  errorRatioAlert: 0.02         # HighErrorRate fires above 2%

@@ -1,0 +1,332 @@
+# jenkins/values.yaml — Jenkins Configuration as Code (static part)
+#
+# Everything Jenkins needs to come up fully configured: plugins, system
+# settings, security context, storage. Nothing is ever clicked in the UI —
+# destroy the cluster, rebuild it, and Jenkins returns identically.
+#
+# Environment-specific values (account ID, cluster name, your IP, certificate
+# ARN, repo URL) are NOT here. They are generated at install time by
+# scripts/configure-jenkins.sh from Terraform outputs, so this file is safe to
+# commit and a second contributor needs no edits.
+#
+# IMPORTANT LESSON ENCODED HERE:
+# The chart generates its OWN JCasC config from controller.* values. If a
+# custom configScript sets a key the chart already sets, JCasC merges both,
+# finds a conflict, and refuses to start with ConfiguratorConflictException.
+# So: prefer the chart's native values; use configScripts only for what the
+# chart does not model.
+
+controller:
+  # --- Pinned image, never :latest (spec requirement) -------------------
+  image:
+    registry: docker.io
+    repository: jenkins/jenkins
+    tag: "2.568.1-lts-jdk21"
+    pullPolicy: IfNotPresent
+
+  # --- Plugins ----------------------------------------------------------
+  # PINNED, and pinned COMPLETELY. Two settings matter here, and the versions
+  # below are the less important of the two.
+  #
+  # installLatestPlugins defaults to TRUE in this chart -- "download the
+  # minimum required version or latest version of all dependencies". With it
+  # on, pinning the plugins we chose would achieve almost nothing: the 78
+  # dependencies they drag in would still each resolve to whatever was newest
+  # the moment the init container ran. Twelve pinned lines, seventy-eight
+  # floating ones. Turning it off is what actually freezes the install.
+  installLatestPlugins: false
+  installLatestSpecifiedPlugins: false
+  #
+  # Regenerate the whole block from a controller that is known good:
+  #
+  #   curl -sk -u "admin:$JENKINS_TOKEN" \
+  #     "$JENKINS_URL/pluginManager/api/json?depth=1&tree=plugins[shortName,version]" \
+  #     | jq -r '.plugins[] | "    - \(.shortName):\(.version)"' | sort
+  #
+  # Then restart the controller and confirm it comes back Ready before
+  # committing -- an unvalidated pin is worse than no pin. README section 10.9.
+  installPlugins:
+    # ---- chosen deliberately: every one backs a step we actually use -------
+    - kubernetes:4547.v52f3080db_8cd               # dynamic pod agents
+    - workflow-aggregator:608.v67378e9d3db_1       # declarative pipeline
+    - git:5.10.1                                   # clone the repository
+    - github:1.47.0                                # webhook trigger
+    - github-branch-source:1983.vfa_27ed961853     # multibranch + PR discovery
+    - configuration-as-code:2117.vc05a_0b_e6b_f4e  # JCasC itself
+    - job-dsl:3732.v9a_c49a_61a_313                # required for the `jobs:` root element
+    - pipeline-stage-view:2.41                     # stage view in the UI
+    - junit:1424.vc64a_edde7777                    # publish test results
+    - pipeline-utility-steps:3.810.va_7672d206740  # readJSON in the CI pipeline
+    - timestamper:1.30                             # the timestamps() pipeline option
+    - ws-cleanup:0.49                              # the cleanWs() step in both pipelines
+    - prometheus:860.v532442b_44e9a_               # /prometheus endpoint (phase 5)
+    # ---- resolved dependencies: GENERATED, do not hand-edit ---------------
+    # Not choices. These are what the twelve above pull in, captured at the
+    # exact versions a working controller had. They are listed so a rebuild
+    # installs the same bytes, not because anyone picked them.
+    #
+    # `mailer` appears here and that is not a contradiction: it arrives as a
+    # dependency, no SMTP is configured for it, and build notifications still
+    # publish to SNS from the agent. `email-ext` is genuinely absent -- a test
+    # asserts it stays that way.
+    - antisamy-markup-formatter:173.v680e3a_b_69ff3
+    - apache-httpcomponents-client-4-api:4.5.14-269.vfa_2321039a_83
+    - asm-api:9.10.1-216.va_9256d3b_844b_
+    - authentication-tokens:1.144.v5ff4a_5ec5c33
+    - bootstrap5-api:5.3.8-1048.va_c299057e35c
+    - bouncycastle-api:2.30.1.84-291.v9f17b_21896e2
+    - branch-api:2.1280.v0d4e5b_b_460ef
+    - caffeine-api:3.2.4-208.v7e2da_a_7db_82b_
+    - checks-api:415.vf022234a_931d
+    - cloudbees-folder:6.1106.v3a_d9a_6d2465e
+    - commons-compress-api:1.28.0-89.v706d5e672f99
+    - commons-lang3-api:3.20.0-109.ve43756e2d2b_4
+    - commons-text-api:1.15.0-218.va_61573470393
+    - credentials:1511.v2e3cb_0008ef0
+    - credentials-binding:728.v902a_273b_8947
+    - display-url-api:2.217.va_6b_de84cc74b_
+    - durable-task:686.v80ff80875b_82
+    - echarts-api:6.1.0-1306.vcee1648c16a_4
+    - font-awesome-api:7.3.1-1013.v0835a_879ec6d
+    - git-client:6.6.1
+    - github-api:1.330-492.v3941a_032db_2a_
+    - gson-api:2.14.0-201.v8eefe5515533
+    - instance-identity:203.v15e81a_1b_7a_38
+    - ionicons-api:94.vcc3065403257
+    - jackson-annotations2-api:2.22-19.v10a_a_582ea_26e
+    - jackson2-api:2.22.2-445.vdc613f1d8012
+    - jackson3-api:3.2.2-96.v599957900a_1a_
+    - jakarta-activation-api:2.1.4-1
+    - jakarta-mail-api:2.1.5-1
+    - jakarta-xml-bind-api:4.0.9-19.v2b_a_5b_44d9a_1c
+    - javax-activation-api:1.2.0-8
+    - jaxb:2.3.9-143.v5979df3304e6
+    - jjwt-api:0.13.0-141.vd58b_a_9592b_6c
+    - joda-time-api:2.14.3-200.v65623733c99f
+    - jquery3-api:3.7.1-687.v68d468e40b_30
+    - json-api:20260814-226.v20f9685d642c
+    - json-path-api:3.0.0-218.vcd4dd1355de2
+    - kubernetes-client-api:7.3.1-256.v788a_0b_787114
+    - kubernetes-credentials:207.v492f58828b_ed
+    - mailer:534.v1b_36f5864073
+    - matrix-project:917.v22eda_817646e
+    - metrics:4.2.37-494.v06f9a_939d33a_
+    - mina-sshd-api-common:2.19.0-192.v2b_a_7b_2c1dc71
+    - mina-sshd-api-core:2.19.0-192.v2b_a_7b_2c1dc71
+    - okhttp-api:5.3.2-200.vedb_720a_cf1f8
+    - pipeline-build-step:599.v4b_67ea_11b_152
+    - pipeline-graph-analysis:254.v0f63a_a_447dca_
+    - pipeline-groovy-lib:798.v5cc688825312
+    - pipeline-input-step:560.v56198a_642157
+    - pipeline-milestone-step:152.v6e22b_8cfc66c
+    - pipeline-model-api:2.2293.v6e7193cec599
+    - pipeline-model-definition:2.2293.v6e7193cec599
+    - pipeline-model-extensions:2.2293.v6e7193cec599
+    - pipeline-rest-api:2.41
+    - pipeline-stage-step:345.va_96187909426
+    - pipeline-stage-tags-metadata:2.2293.v6e7193cec599
+    - plain-credentials:199.v9f8e1f741799
+    - plugin-util-api:7.1341.v039f146993d9
+    - prism-api:1.30.0-741.v034eb_0b_0a_a_fa_
+    - resource-disposer:0.25
+    - scm-api:728.vc30dcf7a_0df5
+    - script-security:1412.v7737b_3405f86
+    - snakeyaml-api:2.5-149.v72471e9c6371
+    - snakeyaml-engine-api:3.1.1-12.v4320c7d6f89c
+    - ssh-credentials:372.va_250881b_08cd
+    - structs:362.va_b_695ef4fdf9
+    - token-macro:477.vd4f0dc3cb_cf1
+    - variant:70.va_d9f17f859e0
+    - woodstox-core-api:7.2.2-10.vcb_629759b_2c2
+    - workflow-api:1413.v2ff1a_5e720fa_
+    - workflow-basic-steps:1098.v808b_fd7f8cf4
+    - workflow-cps:4370.v49a_6937566b_6
+    - workflow-durable-task-step:1479.v56e587f413a_7
+    - workflow-job:1590.v49101d088542
+    - workflow-multibranch:841.vec5b_9e1806ec
+    - workflow-scm-step:466.va_d69e602552b_
+    - workflow-step-api:724.v538c2362b_dfb_
+    - workflow-support:1015.v785e5a_b_b_8b_22
+
+  # --- All builds run on agents; the controller only coordinates ---------
+  numExecutors: 0
+
+  # --- Resources --------------------------------------------------------
+  resources:
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: "1"
+      memory: 2Gi
+
+  # --- Probes (spec bonus) ---------------------------------------------
+  probes:
+    startupProbe:
+      httpGet:
+        path: '/login'
+        port: http
+      periodSeconds: 10
+      failureThreshold: 60
+    livenessProbe:
+      httpGet:
+        path: '/login'
+        port: http
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 5
+    readinessProbe:
+      httpGet:
+        path: '/login'
+        port: http
+      periodSeconds: 10
+      timeoutSeconds: 5
+      failureThreshold: 3
+
+  # --- Security context --------------------------------------------------
+  # Jenkins needs a writable JENKINS_HOME, so the root filesystem cannot be
+  # read-only; everything else is locked down.
+  podSecurityContextOverride:
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    runAsNonRoot: true
+  containerSecurityContext:
+    runAsUser: 1000
+    runAsGroup: 1000
+    readOnlyRootFilesystem: false
+    allowPrivilegeEscalation: false
+    capabilities:
+      drop: ["ALL"]
+    seccompProfile:
+      type: RuntimeDefault
+
+  # --- Exposure ---------------------------------------------------------
+  # HTTPS and the IP restriction are added at install time by
+  # configure-jenkins.sh: the certificate ARN and your public IP are both
+  # environment-specific and must not be committed.
+  serviceType: ClusterIP
+  ingress:
+    enabled: true
+    ingressClassName: alb
+    path: /
+    # MUST be Prefix. The default (ImplementationSpecific) lets the ALB
+    # controller decide, and it treats "/" as an EXACT match — so the root URL
+    # works but /login, /job/... and every static asset return a bare 404 from
+    # the ALB before ever reaching Jenkins.
+    pathType: Prefix
+    annotations:
+      alb.ingress.kubernetes.io/scheme: internet-facing
+      alb.ingress.kubernetes.io/target-type: ip
+      alb.ingress.kubernetes.io/healthcheck-path: /login
+      # Overwritten at install time. If these placeholders ever reach a
+      # running cluster, verify-jenkins.sh fails.
+      alb.ingress.kubernetes.io/inbound-cidrs: "REPLACE_AT_INSTALL"
+
+  # --- Scheduling: the tainted Jenkins node only ------------------------
+  tolerations:
+    - key: "role"
+      operator: "Equal"
+      value: "jenkins"
+      effect: "NoSchedule"
+  # nodeSelector injected at install time (the node group name contains the
+  # cluster name). The label EKS actually sets is `eks.amazonaws.com/nodegroup`
+  # — there is no `-name` suffix.
+
+  # --- JCasC: only what the chart does NOT already model -----------------
+  # NOT set here, because the chart owns them and duplicating causes
+  # ConfiguratorConflictException:
+  #   jenkins.numExecutors          -> controller.numExecutors (above)
+  #   jenkins.securityRealm         -> chart default (local, signup disabled)
+  #   jenkins.authorizationStrategy -> chart default
+  #   jenkins.clouds (kubernetes)   -> chart builds this from agent.* values
+  JCasC:
+    defaultConfig: true
+    configScripts:
+      welcome: |
+        jenkins:
+          systemMessage: >
+            VM Order Portal — CI/CD and observability.
+            Configured entirely by JCasC; no manual UI setup.
+            application-ci builds and scans. application-cd deploys and
+            verifies against Prometheus before the release is kept.
+      prometheus: |
+        # Phase 5 — the Prometheus plugin's endpoint.
+        #
+        # It publishes controller/JVM health, queue length and wait time,
+        # executor counts, dynamic agent counts and per-job build results and
+        # durations. That is the "is the delivery system healthy" third of the
+        # task sheet, and none of it is visible from Kubernetes metrics: a
+        # Jenkins pod can be perfectly Ready while the build queue is stuck.
+        #
+        # NOT SET HERE: collectNodeStatus. The Configuration as Code plugin
+        # cannot set that attribute (jenkinsci/prometheus-plugin#525) and the
+        # controller refuses to START with a configurator exception if you try.
+        # Node status is available from kube-state-metrics anyway.
+        unclassified:
+          prometheusConfiguration:
+            path: "prometheus"
+            defaultNamespace: "jenkins"
+            # 30s, matching the scrape interval. The plugin computes its
+            # metrics on a timer rather than on request, so a collection period
+            # LONGER than the scrape interval means Prometheus repeatedly
+            # records the same stale numbers and every rate() over them is
+            # flat zero - which reads as "nothing is happening" rather than as
+            # "nothing is being measured".
+            collectingMetricsPeriodInSeconds: 30
+            # false = the endpoint is readable without a Jenkins login.
+            #
+            # This is the open decision in docs/PHASE5_PLAN.md §11, and it is
+            # set to the SIMPLE option deliberately rather than by accident.
+            # What bounds it: jenkins/networkpolicy.yaml admits port 8080 only
+            # from the observability namespace and from the ALB, and the ALB is
+            # restricted to the operator's IP. Anyone who can already reach the
+            # Jenkins login page can also read this.
+            #
+            # To close that gap, set this true and give the ServiceMonitor in
+            # helm/observability an `authorization` block pointing at a Secret
+            # holding a Jenkins API token. That costs a token to create, store
+            # and rotate, which is why it is a decision and not a default.
+            useAuthenticatedEndpoint: false
+            countSuccessfulBuilds: true
+            countUnstableBuilds: true
+            countFailedBuilds: true
+            countNotBuiltBuilds: true
+            countAbortedBuilds: true
+            fetchTestResults: true
+            # Disk usage collection walks the whole JENKINS_HOME on a timer.
+            # On an 8Gi EBS volume shared with build workspaces that is real IO
+            # for a number nobody alerts on.
+            collectDiskUsage: false
+
+# --- Persistence: JENKINS_HOME on an EBS volume ---------------------------
+persistence:
+  enabled: true
+  size: 8Gi
+  storageClass: gp2
+
+# --- Controller ServiceAccount --------------------------------------------
+serviceAccount:
+  create: false          # created by jenkins/rbac.yaml, with its RoleBinding
+  name: jenkins
+
+# --- Agents ----------------------------------------------------------------
+# The chart builds the Kubernetes cloud from this section. Each pipeline
+# supplies its own podTemplate (with its own ServiceAccount), so only defaults
+# live here.
+agent:
+  enabled: true
+  namespace: "jenkins"
+  # Agents must tolerate the Jenkins node taint even when a pipeline forgets.
+  tolerations:
+    - key: "role"
+      operator: "Equal"
+      value: "jenkins"
+      effect: "NoSchedule"
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "500m"
+      memory: "512Mi"

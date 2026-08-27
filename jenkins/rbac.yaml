@@ -1,0 +1,171 @@
+# jenkins/rbac.yaml — RBAC
+#
+# THREE identities, each with exactly one job. No cluster-admin, no wildcard
+# verbs, no ClusterRole anywhere — every Role is namespaced.
+#
+#   jenkins            controller. Creates and deletes agent Pods. Cannot
+#                      touch devops-app at all.
+#   jenkins-agent-ci   CI builds. Pushes images to ECR via IRSA. Has NO
+#                      Kubernetes deploy permission whatsoever — this is the
+#                      spec requirement that CI needs no deploy rights, and it
+#                      is enforced here rather than by convention.
+#   jenkins-agent-cd   CD deployments. Manages application objects in
+#                      devops-app. Cannot create Pods, cannot push images.
+#
+# NOT granted to anyone: `secrets`. Jenkins deploys an application whose
+# database password it cannot read. Helm would normally need secrets access
+# for its release history, so both pipelines set HELM_DRIVER=configmap.
+
+---
+# ---------------------------------------------------------------------------
+# 1. Controller: manage agent Pods in its own namespace
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins
+  namespace: jenkins
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jenkins-agent-manager
+  namespace: jenkins
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "delete", "get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jenkins-agent-manager
+  namespace: jenkins
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: jenkins-agent-manager
+subjects:
+  - kind: ServiceAccount
+    name: jenkins
+    namespace: jenkins
+
+---
+# ---------------------------------------------------------------------------
+# 2. CI agent: build and push only
+# ---------------------------------------------------------------------------
+# Deliberately has NO Role and NO RoleBinding. Its only Kubernetes capability
+# is existing as a Pod. Everything it needs (ECR push) comes from AWS via
+# IRSA, not from the Kubernetes API. `kubectl auth can-i create deployments`
+# returns "no" for this identity — verify-jenkins.sh asserts exactly that.
+#
+# The IRSA annotation is added by configure-jenkins.sh from Terraform outputs,
+# because the role ARN contains the account ID.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins-agent-ci
+  namespace: jenkins
+  labels:
+    pipeline: ci
+
+---
+# ---------------------------------------------------------------------------
+# 3. CD agent: deploy the application, nothing else
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: jenkins-agent-cd
+  namespace: jenkins
+  labels:
+    pipeline: cd
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jenkins-deployer
+  namespace: devops-app
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments", "replicasets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "configmaps", "serviceaccounts", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses", "networkpolicies"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["policy"]
+    resources: ["poddisruptionbudgets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Phase 5. The application charts ship a ServiceMonitor -- and ONLY a
+  # ServiceMonitor -- so that is all CD may write, in devops-app and nowhere
+  # else.
+  #
+  # AUDIT FIX. This used to also grant podmonitors and prometheusrules, and the
+  # comment above it claimed "the application charts ship a ServiceMonitor and a
+  # PrometheusRule". They do not: helm/{backend,worker,frontend}/templates
+  # contains servicemonitor.yaml and nothing else. The only PrometheusRule in
+  # the repository lives in helm/observability, which CD does not deploy.
+  #
+  # That is worse than ordinary over-permission, because of what the next
+  # paragraph says. Prometheus discovers rules across namespaces
+  # (serviceMonitorSelectorNilUsesHelmValues: false), so write access to
+  # prometheusrules in devops-app let CD create or overwrite an ALERT RULE --
+  # the exact power the paragraph below says it must not have, granted by the
+  # line the paragraph is attached to. A justification that names a file that
+  # does not exist is how that happens.
+  #
+  # What this deliberately does NOT grant: anything in the observability
+  # namespace. CD may READ Prometheus over HTTP to run its monitoring gate; it
+  # may not reconfigure Prometheus, edit an alert rule, or silence one. A
+  # deploy pipeline that can silence the alert that would have failed it is a
+  # deploy pipeline with no gate at all.
+  - apiGroups: ["monitoring.coreos.com"]
+    resources: ["servicemonitors"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Read-only: needed by rollout status, the running-version check, and
+  # failure diagnostics. Not create/delete — CD does not manage Pods directly.
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jenkins-deployer
+  namespace: devops-app
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: jenkins-deployer
+subjects:
+  # ONLY the CD agent. The CI agent and the controller are deliberately absent:
+  # CI must not be able to deploy, and the controller runs no builds
+  # (numExecutors: 0), so it never needs application access.
+  - kind: ServiceAccount
+    name: jenkins-agent-cd
+    namespace: jenkins

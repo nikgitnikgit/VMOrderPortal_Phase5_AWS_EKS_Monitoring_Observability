@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: Service
+metadata:
+  # The Service NAME is the DNS name other pods use: http://backend:5000
+  name: backend
+  labels:
+    app: backend
+spec:
+  type: ClusterIP   # internal only — never exposed to the internet
+  selector:
+    app: backend
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: {{ .Values.service.port }}
+{{- if .Values.monitoring.enabled }}
+    # A NAMED port, because that is what the ServiceMonitor selects on.
+    # Selecting by number works too, but a name survives a port change and a
+    # number does not - and a ServiceMonitor whose port no longer matches does
+    # not error, it simply scrapes nothing.
+    - name: metrics
+      port: {{ .Values.metricsPort }}
+      targetPort: metrics
+{{- end }}

@@ -1,0 +1,51 @@
+#!/bin/bash
+echo "aws $*" >> "$MOCK_LOG"
+case "$1 $2" in
+  "sts get-caller-identity") echo "123456789012" ;;
+  "ecr get-login-password") echo "mock-token" ;;
+  "ecr describe-repositories") exit 0 ;;
+  "ecr describe-images") exit 1 ;;   # tag absent -> build/push proceeds
+  "eks update-kubeconfig") exit 0 ;;
+  # Two callers, two shapes: uninstall-jenkins.sh polls for a LIST of ALBs and
+  # treats empty output as "released", while destroy.sh's verification asks for
+  # a length(). Returning "0" to both would make the poll loop wait forever on
+  # a load balancer that does not exist.
+  "elbv2 describe-load-balancers")
+      case "$*" in
+          *length\(*) echo "0" ;;   # verification: none left
+          *)           echo "" ;;    # poll: released
+      esac ;;
+  # Two certificates now: one for Jenkins, one for the app. Returning the same
+  # ARN for both would let a regression that reuses the Jenkins certificate for
+  # the application pass unnoticed — which is the exact thing being fixed.
+  "acm list-certificates")
+      case "$*" in
+          *app.vm-order.internal*)     echo "arn:aws:acm:us-east-1:123456789012:certificate/mock-app" ;;
+          *jenkins.vm-order.internal*) echo "arn:aws:acm:us-east-1:123456789012:certificate/mock-jenkins" ;;
+          *)                           echo "None" ;;
+      esac ;;
+  "acm import-certificate")
+      case "$*" in
+          *Purpose,Value=app*) echo "arn:aws:acm:us-east-1:123456789012:certificate/mock-app" ;;
+          *)                   echo "arn:aws:acm:us-east-1:123456789012:certificate/mock-jenkins" ;;
+      esac ;;
+  "s3 rm") exit 0 ;;
+  "s3 cp") exit 0 ;;
+  "s3 ls") exit 0 ;;
+  "s3api list-object-versions") echo "null" ;;
+  # REVIEW FIX 4.7 — destroy.sh now verifies leftovers by tag rather than
+  # asking "is this ACCOUNT empty". Return 0 for every count, i.e. a clean
+  # teardown. tests/run_mock_destroy.sh additionally asserts the queries were
+  # actually made and were tag-scoped.
+  "ec2 describe-instances") echo "0" ;;
+  "ec2 describe-nat-gateways") echo "0" ;;
+  "ec2 describe-vpcs") echo "0" ;;
+  "eks list-clusters") echo "0" ;;
+  "rds describe-db-instances") echo "0" ;;
+  "ec2 describe-network-interfaces") echo "" ;;
+  "ec2 delete-network-interface") exit 0 ;;
+  "ec2 describe-security-groups") echo "" ;;
+  "ec2 delete-security-group") exit 0 ;;
+  "dynamodb delete-table") exit 0 ;;
+  *) exit 0 ;;
+esac

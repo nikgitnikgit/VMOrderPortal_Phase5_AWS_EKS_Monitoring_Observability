@@ -1,0 +1,289 @@
+# NetworkPolicies for the observability namespace.
+#
+# Same shape as the jenkins namespace: default-deny, then named exceptions.
+# The monitoring plane is a high-value target — it can reach every workload in
+# the cluster on a metrics port, and it holds an AWS identity — so it gets the
+# same treatment as the thing that runs arbitrary build code.
+#
+# Requires a CNI that enforces NetworkPolicy. On EKS the AWS VPC CNI does so
+# only when ENABLE_NETWORK_POLICY=true is set on the aws-node DaemonSet;
+# install-jenkins.sh enables it and verify-jenkins.sh checks it. If it cannot
+# be enabled these objects are still valid and still created — they are simply
+# not enforced, and README says so rather than claiming protection that is not
+# active.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: prometheus
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: prometheus
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Grafana and the Prometheus Operator's config-reloader.
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 9090
+        # AUDIT FIX. 8080 is `reloader-web`, the config-reloader sidecar that
+        # runs inside this same pod and that the chart's own ServiceMonitor
+        # scrapes. Allowing only 9090 left it permanently unreachable, and
+        # because `observability` is in targetNamespaces, PrometheusTargetDown
+        # would then fire as a CRITICAL alert forever -- on day one, about the
+        # monitoring stack itself. An alerting system whose first act is to cry
+        # wolf about itself is one nobody reads a week later.
+        - port: 8080
+    # The CD agent's monitoring gate.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.jenkins.namespace }}
+      ports:
+        - port: 9090
+    # NOTE: no ipBlock rule for the VPC. There is no Ingress for Prometheus, so
+    # nothing arrives from an ALB. `kubectl port-forward` is proxied by the API
+    # server through the kubelet and is not affected by NetworkPolicy at all,
+    # which is exactly why it remains the way in.
+  egress:
+    - to: []
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Scraping: the metrics ports of everything we monitor. Deliberately
+    # enumerated rather than "all ports to all namespaces" — Prometheus has no
+    # business opening a connection to port 5432 or 5000.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.app.namespace }}
+      ports:
+        - port: 9090        # backend, worker
+        - port: 9113        # nginx exporter sidecar
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.jenkins.namespace }}
+      ports:
+        - port: 8080        # the Jenkins /prometheus endpoint
+    # Its own namespace: kube-state-metrics, node-exporter, Alertmanager,
+    # Grafana, the operator, and itself.
+    - to:
+        - podSelector: {}
+    # kubelet/cAdvisor on every node, plus the Kubernetes API for service
+    # discovery. Both are reached at node addresses inside the VPC.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # The instance metadata endpoint. Prometheus holds no IRSA role,
+              # but a compromised Prometheus must not be able to reach the NODE
+              # role's credentials either.
+              - 169.254.169.254/32
+      ports:
+        - port: 443
+        - port: 10250       # kubelet read-only metrics
+        - port: 9100        # node-exporter, host network
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: alertmanager
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: alertmanager
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # Prometheus pushing alerts, and the operator's reloader. Nothing else —
+    # in particular, no ALB: Alertmanager has no authentication and gets no
+    # Ingress, same reasoning as Prometheus.
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 9093
+        - port: 8080        # reloader-web, same reasoning as Prometheus above
+        - port: 9094        # the gossip mesh between Alertmanager replicas
+  egress:
+    - to: []
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # SNS over HTTPS. This is the only reason Alertmanager needs the internet,
+    # and the one thing that must never be broken by a policy edit: an
+    # Alertmanager that cannot reach SNS does not fail loudly, it simply stops
+    # telling anyone anything.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              # IRSA gives it a scoped role; the node role must stay out of
+              # reach.
+              - 169.254.169.254/32
+      ports:
+        - port: 443
+    - to:
+        - podSelector: {}
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: grafana
+  namespace: {{ .Values.namespace }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: grafana
+  policyTypes: [Ingress, Egress]
+  ingress:
+    # The ALB targets pod IPs directly, so its traffic originates inside the
+    # VPC. Grafana is the ONE component here with a login of its own, which is
+    # what makes exposing it defensible at all.
+    - from:
+        - ipBlock:
+            cidr: {{ .Values.vpcCidr | default "10.23.0.0/16" }}
+      ports:
+        - port: 3000
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 3000
+  egress:
+    - to: []
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Prometheus, its only datasource. Grafana has no reason to reach the
+    # internet: the dashboards come from ConfigMaps, not from grafana.com.
+    - to:
+        - podSelector: {}
+    # The Kubernetes API, for the sidecar that watches dashboard ConfigMaps.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+      ports:
+        - port: 443
+
+---
+# AUDIT FIX -- the upgrade path, which nothing had exercised.
+#
+# kube-prometheus-stack runs two short-lived Jobs to create and patch the
+# admission webhook's certificate: a pre-install/pre-upgrade `create` and a
+# post-install/post-upgrade `patch`. Both do nothing but talk to the Kubernetes
+# API, and both run as pods in THIS namespace.
+#
+# On a first install that works by accident: the pre-install hook runs before
+# any object in this chart exists, so default-deny-all is not there yet. On an
+# UPGRADE it is there, the Job gets no egress, it cannot reach the API server,
+# it times out, and `helm upgrade` fails with a hook error that names a Job
+# nobody has heard of and says nothing about NetworkPolicy.
+#
+# So the first install succeeds and every subsequent one fails -- the failure
+# mode most likely to be discovered in the middle of shipping something else.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: admission-webhook-hooks
+  namespace: {{ .Values.namespace }}
+  annotations:
+    # Created before the hook Jobs that need it, and left in place afterwards:
+    # the pre-upgrade hook of the NEXT upgrade needs it just as much.
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: kube-prometheus-stack-admission-webhook
+  policyTypes: [Egress]
+  egress:
+    - to: []
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+      ports:
+        - port: 443
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: exporters
+  namespace: {{ .Values.namespace }}
+spec:
+  # kube-state-metrics, node-exporter, the operator. They are scrape TARGETS:
+  # they answer, they do not initiate.
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/name
+        operator: In
+        # AUDIT FIX. The operator's label is NOT "prometheus-operator". The
+        # chart sets
+        #     app.kubernetes.io/name: <chart name>-prometheus-operator
+        # so with this chart it is "kube-prometheus-stack-prometheus-operator",
+        # and "prometheus-operator" is only the app.kubernetes.io/COMPONENT.
+        #
+        # This is the most dangerous shape a NetworkPolicy bug can take: a
+        # selector that matches nothing is not an error and is not visible in
+        # `kubectl get netpol`. The operator simply fell through to
+        # default-deny-all above -- no DNS, no API server -- so it could never
+        # create the Prometheus or Alertmanager StatefulSets. The whole stack
+        # would come up as a Deployment with nothing behind it.
+        #
+        # Both values are listed rather than one: the component label is stable
+        # across chart renames, and a stale entry here costs nothing while a
+        # missing one costs the entire monitoring plane.
+        values:
+          - kube-state-metrics
+          - prometheus-node-exporter
+          - kube-prometheus-stack-prometheus-operator
+          - prometheus-operator
+  policyTypes: [Ingress, Egress]
+  ingress:
+    - from:
+        - podSelector: {}
+  egress:
+    - to: []
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # kube-state-metrics and the operator both watch the Kubernetes API.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.169.254/32
+      ports:
+        - port: 443

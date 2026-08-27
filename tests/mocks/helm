@@ -1,0 +1,21 @@
+#!/bin/bash
+echo "helm $*" >> "$MOCK_LOG"
+case "$*" in
+  *"search repo"*"kube-prometheus-stack"*)
+    # Phase 5. Emulate the real output so install-observability.sh's version
+    # guard matches. Read from the committed CHART_VERSION rather than
+    # hardcoded, so bumping the pin does not silently break this mock into
+    # always-succeeding.
+    ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+    VER=$(tr -d '[:space:]' < "$ROOT/helm/observability/CHART_VERSION" 2>/dev/null || echo "0.0.0")
+    echo "NAME                                         CHART VERSION   APP VERSION   DESCRIPTION"
+    echo "prometheus-community/kube-prometheus-stack   ${VER}          v0.91.0       kube-prometheus-stack"
+    ;;
+  *"search repo"*)
+    # emulate the real output so the version guard can match
+    VER=$(tr -d '[:space:]' < "$(dirname "${BASH_SOURCE[0]}")/../../jenkins/CHART_VERSION" 2>/dev/null || echo "0.0.0")
+    echo "NAME             CHART VERSION   APP VERSION   DESCRIPTION"
+    echo "jenkins/jenkins  ${VER}          2.999.9       Jenkins - Build great things"
+    ;;
+esac
+exit 0

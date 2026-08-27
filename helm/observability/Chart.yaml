@@ -1,0 +1,9 @@
+apiVersion: v2
+name: observability
+description: >
+  The objects Phase 5 owns: Grafana dashboards as ConfigMaps, platform-level
+  PrometheusRules, the Jenkins scrape target, and the NetworkPolicies that
+  fence the monitoring namespace.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

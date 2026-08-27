@@ -1,0 +1,292 @@
+# Platform-level rules: the SLO recording rules and the six required alerts.
+#
+# WHY RECORDING RULES AND NOT JUST ALERT EXPRESSIONS
+#
+# The SLI expressions are evaluated in four places: the alert, the Grafana
+# panel, the CD monitoring gate, and the SLO document. Written out four times
+# they drift, and the day they drift is the day the gate passes a release the
+# alert is simultaneously firing about. A recording rule makes all four
+# consumers read the SAME number, and it makes that number cheap to query.
+#
+# Naming follows the Prometheus convention level:metric:operation, so
+# `sli:http_error_ratio:rate5m` reads as "aggregated to the SLI level, of
+# http errors, as a 5-minute ratio".
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: platform-slo-and-alerts
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/part-of: vm-order-portal
+spec:
+  groups:
+
+    # =======================================================================
+    - name: sli.recording
+      interval: 30s
+      rules:
+        # Error ratio over 5 minutes. `or vector(0)` is deliberate: with no
+        # traffic at all the division produces an empty result, and an empty
+        # result in an alert expression means "do not fire", which is right.
+        # But the same empty result on a dashboard panel renders as "No data",
+        # which reads identically to "Prometheus is broken". vector(0) makes
+        # zero traffic show as a real zero.
+        - record: sli:http_error_ratio:rate5m
+          expr: |
+            (
+              sum(rate(http_requests_total{namespace="{{ .Values.app.namespace }}",status="5xx"}[5m]))
+              /
+              sum(rate(http_requests_total{namespace="{{ .Values.app.namespace }}"}[5m]))
+            ) or vector(0)
+
+        # The 30-minute window the availability SLO is stated over.
+        - record: sli:http_availability:ratio30m
+          expr: |
+            (
+              1 - (
+                sum(rate(http_requests_total{namespace="{{ .Values.app.namespace }}",status="5xx"}[30m]))
+                /
+                sum(rate(http_requests_total{namespace="{{ .Values.app.namespace }}"}[30m]))
+              )
+            ) or vector(1)
+
+        # p95 latency across the service.
+        #
+        # `sum by (le)` before histogram_quantile, not after: the buckets have
+        # to be aggregated across pods and routes FIRST, or the quantile is
+        # computed per-series and then averaged, which is not a percentile of
+        # anything. This is the single most common way a p95 panel ends up
+        # quietly wrong.
+        - record: sli:http_latency_p95:rate5m
+          expr: |
+            histogram_quantile(0.95,
+              sum by (le) (
+                rate(http_request_duration_seconds_bucket{namespace="{{ .Values.app.namespace }}"}[5m])
+              )
+            )
+
+        - record: sli:http_latency_p99:rate5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (le) (
+                rate(http_request_duration_seconds_bucket{namespace="{{ .Values.app.namespace }}"}[5m])
+              )
+            )
+
+        # Requests per second, by service — the traffic panel, and the
+        # denominator anyone checks first when an error RATIO spikes because
+        # traffic collapsed rather than because errors rose.
+        - record: sli:http_requests:rate5m
+          expr: sum by (service) (rate(http_requests_total{namespace="{{ .Values.app.namespace }}"}[5m]))
+
+    # =======================================================================
+    - name: application.alerts
+      rules:
+        - alert: HighErrorRate
+          expr: sli:http_error_ratio:rate5m > {{ .Values.slo.errorRatioAlert }}
+          for: 5m
+          labels:
+            severity: critical
+            component: application
+          annotations:
+            summary: "5xx ratio is {{`{{ $value | humanizePercentage }}`}}, above the {{ .Values.slo.errorRatioAlert }} threshold"
+            description: >-
+              More than {{ .Values.slo.errorRatioAlert }} of requests to the VM Order Portal have
+              returned 5xx for five minutes. Customers are seeing failures now.
+              Check dependency_failures_total to see which hop broke before
+              looking anywhere else.
+            runbook_url: "{{ .Values.runbookBaseUrl }}/HighErrorRate.md"
+
+        - alert: HighLatencyP95
+          expr: sli:http_latency_p95:rate5m > {{ .Values.slo.latencyP95Seconds }}
+          for: 10m
+          labels:
+            severity: warning
+            component: application
+          annotations:
+            summary: "p95 latency is {{`{{ $value | humanizeDuration }}`}}, above the {{ .Values.slo.latencyP95Seconds }}s SLO"
+            description: >-
+              The 95th percentile request has been slower than the SLO for ten
+              minutes. 10m rather than 5m on purpose: latency is noisier than
+              errors and a five-minute window pages on ordinary traffic spikes.
+            runbook_url: "{{ .Values.runbookBaseUrl }}/HighLatencyP95.md"
+
+    # =======================================================================
+    - name: kubernetes.alerts
+      rules:
+        - alert: ReplicasMismatch
+          # Only for OUR namespace. The cluster-wide version of this alert
+          # fires during every normal rollout of every system component.
+          expr: |
+            kube_deployment_status_replicas_available{namespace="{{ .Values.app.namespace }}"}
+              < kube_deployment_spec_replicas{namespace="{{ .Values.app.namespace }}"}
+          # 10 minutes, because a rolling update legitimately produces this
+          # state for a minute or two. Shorter and the alert fires on every
+          # successful deploy, which trains everyone to ignore it.
+          for: 10m
+          labels:
+            severity: warning
+            component: kubernetes
+          annotations:
+            summary: "{{`{{ $labels.deployment }}`}} has fewer available replicas than desired"
+            description: >-
+              A deployment has been short of replicas for ten minutes, which is
+              longer than any healthy rollout. Usually a failing readiness
+              probe, an image that cannot be pulled, or no node with room.
+            runbook_url: "{{ .Values.runbookBaseUrl }}/ReplicasMismatch.md"
+
+        - alert: NodeNotReadyOrPressure
+          expr: |
+            kube_node_status_condition{condition="Ready",status="true"} == 0
+            or kube_node_status_condition{condition="MemoryPressure",status="true"} == 1
+            or kube_node_status_condition{condition="DiskPressure",status="true"} == 1
+          for: 5m
+          labels:
+            severity: critical
+            component: kubernetes
+          annotations:
+            summary: "Node {{`{{ $labels.node }}`}} is not Ready or is under resource pressure"
+            description: >-
+              With four nodes and three of them single-purpose, losing one is
+              not a degradation that can be ridden out: lose the monitoring
+              node and this alert is the last thing you will hear about it.
+            runbook_url: "{{ .Values.runbookBaseUrl }}/NodeNotReadyOrPressure.md"
+
+        - alert: PodRestartingRepeatedly
+          expr: |
+            increase(kube_pod_container_status_restarts_total{namespace=~"{{ join "|" .Values.targetNamespaces }}"}[30m]) > 3
+          for: 5m
+          labels:
+            severity: warning
+            component: kubernetes
+          annotations:
+            summary: "{{`{{ $labels.namespace }}/{{ $labels.pod }}`}} has restarted more than 3 times in 30 minutes"
+            description: >-
+              A CrashLoopBackOff that keeps almost working is invisible to a
+              replica count: the pod comes back, the deployment reports
+              available, and the requests in flight at each restart are simply
+              lost.
+            runbook_url: "{{ .Values.runbookBaseUrl }}/PodRestartingRepeatedly.md"
+
+    # =======================================================================
+    - name: jenkins.alerts
+      rules:
+        - alert: JenkinsQueueStuck
+          # Queue length above zero is normal for a few minutes: an agent pod
+          # takes time to schedule and pull. Fifteen minutes of a non-empty
+          # queue means the pod is not coming — a taint, a full node, an image
+          # that will not pull.
+          #
+          # The single `jenkins_` prefix is guaranteed by the metricRelabelings
+          # in servicemonitor-jenkins.yaml, which collapse the plugin's likely
+          # `jenkins_jenkins_` doubling at scrape time. See the comment there:
+          # the prefix could not be confirmed without a running controller, so
+          # it is normalised once rather than guessed in sixteen places.
+          expr: |
+            min_over_time(jenkins_queue_size_value[15m]) > 0
+          for: 15m
+          labels:
+            severity: warning
+            component: jenkins
+          annotations:
+            summary: "Jenkins build queue has been non-empty for 15 minutes"
+            description: >-
+              min_over_time, not avg: the queue must have been continuously
+              occupied for the whole window. An average would fire on a busy
+              afternoon of perfectly healthy builds.
+            runbook_url: "{{ .Values.runbookBaseUrl }}/JenkinsQueueStuck.md"
+
+        - alert: JenkinsDown
+          expr: up{namespace="{{ .Values.jenkins.namespace }}"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            component: jenkins
+          annotations:
+            summary: "Jenkins controller is not being scraped"
+            description: >-
+              Either the controller is down or the scrape path is broken. Both
+              mean no release can be made and no build metric is being
+              recorded.
+            runbook_url: "{{ .Values.runbookBaseUrl }}/JenkinsQueueStuck.md"
+
+    # =======================================================================
+    - name: monitoring.alerts
+      rules:
+        - alert: PrometheusTargetDown
+          # Scoped to the namespaces we own. Cluster-wide, this fires on every
+          # kube-system component that is briefly restarting and becomes noise
+          # within a day.
+          expr: up{namespace=~"{{ join "|" .Values.targetNamespaces }}"} == 0
+          for: 5m
+          labels:
+            severity: critical
+            component: monitoring
+          annotations:
+            summary: "Target {{`{{ $labels.job }}`}} in {{`{{ $labels.namespace }}`}} is down"
+            description: >-
+              A scrape target has been unreachable for five minutes. Until it
+              comes back, every alert that depends on its metrics is silent —
+              which is not the same as healthy, and is the more dangerous of
+              the two.
+            runbook_url: "{{ .Values.runbookBaseUrl }}/PrometheusTargetDown.md"
+
+        - alert: PrometheusStorageFillingUp
+          # The failure this exists to prevent: a full Prometheus disk wedges
+          # the process, and recovery means deleting data by hand from a volume
+          # you cannot easily mount. Warn with room to act.
+          #
+          # AUDIT FIX -- this alert could not fire.
+          #
+          # It used to divide prometheus_tsdb_storage_blocks_bytes by
+          # kubelet_volume_stats_capacity_bytes `on(instance)`. Those two
+          # metrics never share an `instance`: the first is labelled with the
+          # Prometheus POD's scrape address, the second with the NODE's kubelet
+          # address. The join matched nothing, the expression returned an empty
+          # vector at every evaluation, and an empty vector means "do not fire".
+          #
+          # Nothing anywhere reports this. promtool accepts it, the rule shows
+          # as healthy in the Prometheus UI, and the alert sits there looking
+          # exactly like an alert that is simply not triggering -- which is what
+          # you WANT it to look like, right up until the disk fills.
+          #
+          # The kubelet already publishes both halves for the same PVC, so no
+          # join is needed at all. Matching on the claim name keeps it pinned to
+          # Prometheus's own volume rather than every PVC in the namespace.
+          expr: |
+            (
+              1 - (
+                kubelet_volume_stats_available_bytes{namespace="{{ .Values.namespace }}",persistentvolumeclaim=~"prometheus-.*"}
+                /
+                kubelet_volume_stats_capacity_bytes{namespace="{{ .Values.namespace }}",persistentvolumeclaim=~"prometheus-.*"}
+              )
+            ) > 0.8
+          for: 30m
+          labels:
+            severity: warning
+            component: monitoring
+          annotations:
+            summary: "Prometheus is using more than 80% of its volume"
+            description: >-
+              retentionSize should be trimming blocks before this happens. If
+              it is not, either the setting was raised above the volume size or
+              series churn is higher than the sizing assumed.
+            runbook_url: "{{ .Values.runbookBaseUrl }}/PrometheusTargetDown.md"
+
+        - alert: AlertmanagerNotificationsFailing
+          # The alert about the alerts. Without it, a broken SNS receiver is
+          # completely silent by construction: the one channel that would tell
+          # you is the one that is broken.
+          expr: |
+            increase(alertmanager_notifications_failed_total{namespace="{{ .Values.namespace }}"}[10m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+            component: monitoring
+          annotations:
+            summary: "Alertmanager cannot deliver notifications"
+            description: >-
+              Alerts are firing and nobody is being told. Usually the IRSA role
+              annotation on the alertmanager ServiceAccount, or the SNS topic
+              ARN, or egress on 443 from the observability namespace.
+            runbook_url: "{{ .Values.runbookBaseUrl }}/PrometheusTargetDown.md"

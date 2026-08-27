@@ -1,0 +1,93 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "apiVersion",
+    "kind",
+    "metadata",
+    "spec"
+  ],
+  "properties": {
+    "apiVersion": {
+      "const": "monitoring.coreos.com/v1"
+    },
+    "kind": {
+      "const": "PrometheusRule"
+    },
+    "metadata": {
+      "type": "object"
+    },
+    "spec": {
+      "type": "object",
+      "required": [
+        "groups"
+      ],
+      "properties": {
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "rules"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "interval": {
+                "type": "string"
+              },
+              "limit": {
+                "type": "integer"
+              },
+              "partial_response_strategy": {
+                "type": "string"
+              },
+              "rules": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": [
+                    "expr"
+                  ],
+                  "properties": {
+                    "record": {
+                      "type": "string"
+                    },
+                    "alert": {
+                      "type": "string"
+                    },
+                    "expr": {
+                      "type": [
+                        "string",
+                        "number"
+                      ]
+                    },
+                    "for": {
+                      "type": "string"
+                    },
+                    "keep_firing_for": {
+                      "type": "string"
+                    },
+                    "labels": {
+                      "type": "object"
+                    },
+                    "annotations": {
+                      "type": "object"
+                    }
+                  },
+                  "additionalProperties": false
+                }
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

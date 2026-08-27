@@ -1,0 +1,72 @@
+# The Jenkins scrape target.
+#
+# This one lives HERE rather than in a Jenkins chart because Jenkins is
+# installed from the upstream chart with jenkins/values.yaml — there is no
+# chart of ours to put it in. It is platform, not application, and it is not
+# tied to any application release.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: jenkins
+  namespace: {{ .Values.namespace }}
+  labels:
+    app.kubernetes.io/part-of: vm-order-portal
+spec:
+  # Cross-namespace: the object lives in observability, the Service it selects
+  # lives in jenkins. namespaceSelector is what makes that legal, and
+  # jenkins/networkpolicy.yaml is what makes it actually connect.
+  namespaceSelector:
+    matchNames: [{{ .Values.jenkins.namespace }}]
+  selector:
+    matchLabels:
+      app.kubernetes.io/component: jenkins-controller
+      app.kubernetes.io/instance: jenkins
+  endpoints:
+    - port: http
+      # Matches unclassified.prometheusConfiguration.path in jenkins/values.yaml.
+      # These two strings must agree; if they do not, the target is UP and
+      # returns a 404 body that Prometheus records as a failed scrape.
+      path: {{ .Values.jenkins.path }}
+      interval: 30s
+      scrapeTimeout: 10s
+      # The plugin computes metrics on a 30s timer and serves whatever it last
+      # computed, so a scrape can take longer than a cheap /metrics endpoint.
+      # 10s is generous; the alternative is intermittent scrape timeouts that
+      # look exactly like a flapping controller.
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_pod_name]
+          targetLabel: pod
+        - sourceLabels: [__meta_kubernetes_namespace]
+          targetLabel: namespace
+      # AUDIT FIX -- normalise the plugin's metric prefix at scrape time.
+      #
+      # The Jenkins Prometheus plugin prefixes every metric with the namespace
+      # configured in jenkins/values.yaml, and its own metric names ALREADY
+      # begin with `jenkins_`. With `defaultNamespace: "jenkins"` the series
+      # very probably arrives as
+      #
+      #     jenkins_jenkins_queue_size_value
+      #
+      # while the JenkinsQueueStuck alert and all fifteen panels in
+      # dashboards/jenkins-delivery.json ask for `jenkins_queue_size_value`.
+      # If that is what the plugin emits, every one of them is permanently
+      # empty — and an empty Jenkins dashboard looks like an idle Jenkins.
+      #
+      # Confirming it needs a running controller, which this repository's
+      # offline validation deliberately does not have:
+      #   kubectl exec -n jenkins deploy/jenkins -- \
+      #     curl -s localhost:8080/prometheus | grep queue_size
+      #
+      # So rather than guess a name in sixteen places, the doubled prefix is
+      # collapsed here, once. The rule is a no-op if the plugin does not double
+      # it: the regex simply does not match and __name__ is left alone. That
+      # makes the queries correct either way, which guessing could not.
+      #
+      # scripts/verify-observability.sh asserts at runtime that the metric
+      # exists under the expected name, so a mistake in this reasoning shows up
+      # as a failed verification rather than as a dashboard of flat lines.
+      metricRelabelings:
+        - sourceLabels: [__name__]
+          regex: 'jenkins_jenkins_(.*)'
+          targetLabel: __name__
+          replacement: 'jenkins_${1}'

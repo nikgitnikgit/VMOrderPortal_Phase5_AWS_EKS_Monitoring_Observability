@@ -1,0 +1,34 @@
+# k8s/storageclass-gp3.yaml
+#
+# EKS ships one StorageClass, "gp2", and it is the default. Prometheus is put
+# on gp3 instead, and the reason is IOPS rather than price.
+#
+# gp2 gives 3 IOPS per GiB with a FLOOR of 100. A 10 GiB gp2 volume and a
+# 20 GiB gp2 volume therefore both get exactly 100 baseline IOPS -- size buys
+# nothing at all until 34 GiB. Over-provisioning a gp2 volume to "make
+# Prometheus faster" is a pure waste of money.
+#
+# gp3 gives 3000 IOPS and 125 MB/s baseline at ANY size, and costs
+# $0.08/GiB-month against gp2's $0.10. Prometheus compaction is IO-heavy, so
+# this is a real difference in the cheaper direction.
+#
+# Not marked default: the Jenkins PVC deliberately stays on gp2 so that
+# changing this file cannot silently re-provision the CI controller's volume.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: gp3
+  labels:
+    app.kubernetes.io/part-of: vm-order-portal
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+  encrypted: "true"
+# WaitForFirstConsumer, not Immediate. An EBS volume lives in ONE availability
+# zone. Provisioning it before the scheduler has picked a node can create it in
+# a zone the pod cannot be scheduled into, and the pod then sits Pending
+# forever with a "volume node affinity conflict" that reads like a bug in the
+# scheduler. Waiting means the volume is created in the zone the pod landed in.
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Delete

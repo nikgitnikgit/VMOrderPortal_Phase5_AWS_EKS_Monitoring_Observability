@@ -1,0 +1,52 @@
+%% docs/architecture-monitoring-flow.mmd — Phase 5 Proof Chain
+%% The defence question is "show me one commit becoming a number on a
+%% dashboard, and one broken thing becoming an alert". This is that chain,
+%% left to right, with the two NEW gates marked.
+%% Every box names the artefact that proves that step happened, so the
+%% evidence pack is just this diagram walked end to end.
+
+flowchart LR
+
+    subgraph DEV["1 — change"]
+        C["<b>git commit</b><br/>short SHA = the image tag<br/><i>evidence: git log</i>"]
+    end
+
+    subgraph CI["2 — CI · application-ci"]
+        V["<b>Validate</b> <i>NEW steps</i><br/>promtool check rules<br/>kubeconform ServiceMonitor + PrometheusRule<br/>dashboard JSON schema + PromQL parse<br/><i>evidence: console log</i>"]
+        B["<b>Build + scan + push</b><br/>records <b>image digest</b><br/><i>evidence: image-manifest.json</i>"]
+    end
+
+    subgraph CD["3 — CD · application-cd"]
+        VD["<b>Verify digest</b><br/>ECR digest must equal the one CI scanned<br/><i>evidence: console log</i>"]
+        D["<b>helm upgrade</b><br/>image tag + <b>APP_VERSION / GIT_SHA</b> env<br/>the chart ships its ServiceMonitor<br/>(alert rules are platform, not per-app)"]
+        G["<b>MONITORING GATE</b> <i>NEW</i><br/>ask Prometheus, over a 3 min window:<br/>1. all app targets up == 3?<br/>2. 5xx ratio under the SLO burn threshold?<br/>3. p95 latency under the SLO?<br/><b>any answer no ⇒ helm rollback</b><br/><i>evidence: gate output + rollback log</i>"]
+    end
+
+    subgraph RUN["4 — running system"]
+        P["<b>Pod</b><br/>image tag = the commit SHA<br/>exposes :9090/metrics<br/><i>evidence: kubectl get pods -o jsonpath</i>"]
+        M["<b>app_build_info</b>{version, git_sha, release}<br/>the metric that carries the commit<br/>into the time series database"]
+        DB["<b>Grafana dashboard</b><br/>release annotation moves<br/>to the new git_sha<br/><i>evidence: screenshot</i>"]
+    end
+
+    subgraph FAIL["5 — when it breaks"]
+        R["<b>rule fires</b><br/>HighErrorRate · HighLatencyP95<br/>ReplicasMismatch · NodeNotReady<br/>JenkinsQueueStuck · PrometheusTargetDown"]
+        A["<b>Alertmanager</b><br/>severity · summary · description<br/><b>runbook_url</b> on every alert"]
+        N["<b>SNS ⇒ inbox</b><br/><i>evidence: email screenshot</i>"]
+        RB["<b>runbook</b><br/>docs/runbooks/*.md<br/>the drill that proves it"]
+    end
+
+    C --> V --> B --> VD --> D --> G --> P --> M --> DB
+    P -.->|"metrics scraped every 30s"| R
+    R ==> A ==> N
+    A -.->|"link"| RB
+    G -.->|"the gate asks the same<br/>Prometheus the alerts use"| R
+
+    classDef new fill:#f3ecff,stroke:#6b3fa0,stroke-width:3px
+    classDef ok fill:#e6f7ee,stroke:#1d7a4c,stroke-width:2px
+    classDef ci fill:#e3f0ff,stroke:#2563a8,stroke-width:2px
+    classDef bad fill:#ffe5e5,stroke:#c0392b,stroke-width:2px
+
+    class V,G,M new
+    class C,B,VD,D ci
+    class P,DB ok
+    class R,A,N,RB bad

@@ -1,0 +1,113 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  labels:
+    app: frontend
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      # Spread replicas across different nodes (our availability decision).
+      # ScheduleAnyway = soft rule: better one node with two replicas than
+      # a pod stuck Pending during a node failure.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: frontend
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: frontend
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
+          # /healthz is served directly by nginx (added in our nginx.conf)
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+{{- if .Values.monitoring.enabled }}
+        # --- nginx metrics exporter -----------------------------------------
+        # Reads nginx's stub_status over LOOPBACK (a sidecar shares the pod's
+        # network namespace) and republishes it as Prometheus metrics.
+        #
+        # This is the only thing in the pod that talks to 127.0.0.1:8081, and
+        # nothing outside the pod can reach that address at all - which is why
+        # stub_status needs no access rule of its own.
+        - name: nginx-exporter
+          image: "{{ .Values.exporter.image.repository }}:{{ .Values.exporter.image.tag }}{{ if .Values.exporter.image.digest }}@{{ .Values.exporter.image.digest }}{{ end }}"
+          args:
+            - --nginx.scrape-uri=http://127.0.0.1:8081/stub_status
+            - --web.listen-address=:{{ .Values.metricsPort }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.metricsPort }}
+          resources:
+            requests:
+              cpu: {{ .Values.exporter.resources.requests.cpu }}
+              memory: {{ .Values.exporter.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.exporter.resources.limits.cpu }}
+              memory: {{ .Values.exporter.resources.limits.memory }}
+          # The namespace enforces the "restricted" Pod Security standard, so
+          # this has to satisfy it like every other container here. The
+          # exporter reads one HTTP endpoint and writes to a socket; it needs
+          # no filesystem and no capabilities whatsoever.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 65534
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
+          # A sidecar that dies silently turns the availability SLI into a flat
+          # line at "no data", which reads like calm. Probe it.
+          readinessProbe:
+            httpGet:
+              path: /metrics
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 20
+{{- end }}
+      volumes:
+        - name: tmp
+          emptyDir: {}

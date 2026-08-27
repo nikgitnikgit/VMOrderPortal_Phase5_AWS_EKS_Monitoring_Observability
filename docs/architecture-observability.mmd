@@ -1,0 +1,102 @@
+%% docs/architecture-observability.mmd — Phase 5 Observability View
+%% What Phase 5 ADDS to the Phase 4 deployment. Phase 4 objects are drawn in
+%% their existing colours; everything Phase 5 introduces is PURPLE. If a box is
+%% purple, it does not exist yet.
+%% Four flows, and the arrow style tells you which is which:
+%%   dotted  SCRAPE   Prometheus PULLS from every target. Nothing pushes to it.
+%%   solid   QUERY    Grafana and the CD gate both ask Prometheus in PromQL.
+%%   thick   ALERT    Prometheus evaluates rules -> Alertmanager -> SNS -> inbox.
+%%   solid   EXPOSE   Only Grafana gets an ALB, and only from the operator IP.
+%% Deliberately NOT drawn: ECR, S3, RDS and the helm-upgrade path. They are
+%% unchanged from docs/architecture-deployment.mmd and drawing them again here
+%% only adds crossings. This picture answers one question: how does a number
+%% get from a pod to a dashboard, and from a rule to an inbox.
+
+flowchart LR
+
+    subgraph NET["INTERNET"]
+        direction LR
+        USR(["End user"])
+        OPS(["Operator<br/>one public IP"])
+        MAIL(["Email inbox<br/>SNS subscription"])
+    end
+
+    subgraph VPC["VPC 10.23.0.0/16"]
+
+        subgraph PUB["PUBLIC SUBNETS"]
+            ALBA["<b>ALB — application</b><br/>HTTPS 443<br/><i>phase 4</i>"]
+            ALBG["<b>ALB — Grafana</b><br/>HTTPS 443 · ACM cert purpose=grafana<br/>inbound-cidrs = operator IP only"]
+        end
+
+        subgraph MON["node group <b>monitoring-nodes</b> · 1 x m7i-flex.large · TAINTED role=monitoring"]
+            subgraph OBS["namespace: observability"]
+                GRAF["<b>Grafana</b><br/>NO PVC, on purpose<br/>datasource + 3 dashboards from Git<br/>incl. the scrape-health row —<br/>the authenticated view of /targets"]
+                PROM["<b>Prometheus</b><br/>retention 15d · retentionSize 7GB<br/>PVC 10Gi gp3 · scrape 30s<br/><i>no Ingress — port-forward only</i>"]
+                AM["<b>Alertmanager</b><br/>PVC 1Gi · IRSA on its SA<br/>grouping · inhibition · silences"]
+                OPER["<b>Prometheus Operator</b><br/>turns ServiceMonitor / PodMonitor /<br/>PrometheusRule objects into<br/>scrape config, then reloads"]
+                KSM["<b>kube-state-metrics</b><br/>desired vs available replicas,<br/>restarts, rollouts, PVC usage"]
+            end
+        end
+
+        subgraph ALLN["every node — app, jenkins and monitoring alike"]
+            NEX["<b>node-exporter</b> DaemonSet<br/>node CPU · memory · disk · network"]
+            KUBELET["<b>kubelet / cAdvisor</b><br/>already on every node<br/>container CPU, memory, throttling"]
+        end
+
+        subgraph AN["node group <b>app-nodes</b> · 3 x t3.small · namespace devops-app"]
+            FE["<b>frontend</b> x2 · nginx :8080<br/>+ nginx-exporter sidecar :9113"]
+            BE["<b>backend</b> x2 · Flask :5000<br/><b>:9090/metrics</b><br/>own port — never the probe port"]
+            WK["<b>worker</b> x2 · Flask :5001<br/><b>:9090/metrics</b>"]
+            SMA["<b>ServiceMonitor</b> per service<br/>shipped inside helm/frontend ·<br/>helm/backend · helm/worker<br/><i>only a ServiceMonitor — the rules<br/>all live in helm/observability</i>"]
+        end
+
+        subgraph JN["node group <b>jenkins-nodes</b> · 1 x m7i-flex.large · TAINTED role=jenkins"]
+            JC["<b>jenkins-0</b> controller<br/><b>/prometheus</b> endpoint<br/>queue · executors · agents · build results"]
+            SMJ["<b>ServiceMonitor: jenkins</b><br/>+ the Jenkins alert rules<br/><i>both authored in helm/observability,<br/>drawn here beside what they target</i>"]
+            ACD["<b>CD agent</b> · ephemeral<br/>deploys, then <b>asks Prometheus</b><br/>gate fails ⇒ helm rollback"]
+            ACI["<b>CI agent</b> · ephemeral<br/>validates rules, dashboards,<br/>ServiceMonitors<br/><i>never deploys them</i>"]
+        end
+
+    end
+
+    SNS["<b>SNS topic</b><br/><i>already exists — Jenkins publishes<br/>build notifications to it</i>"]
+
+    %% ---- exposure -----------------------------------------------------
+    USR --> ALBA --> FE
+    OPS --> ALBG --> GRAF
+    OPS -. "kubectl port-forward 9090<br/>the only way in" .-> PROM
+
+    %% ---- scrape: Prometheus pulls -------------------------------------
+    PROM -. ":9090/metrics" .-> BE
+    PROM -. ":9090/metrics" .-> WK
+    PROM -. ":9113/metrics" .-> FE
+    PROM -. ":8080/prometheus" .-> JC
+    PROM -. scrape .-> KSM
+    PROM -. scrape .-> NEX
+    PROM -. scrape .-> KUBELET
+
+    %% ---- the operator builds that scrape config from Git objects ------
+    SMA --> OPER
+    SMJ --> OPER
+    OPER --> PROM
+
+    %% ---- query --------------------------------------------------------
+    GRAF -->|"PromQL — its only datasource"| PROM
+    ACD -->|"targets UP? 5xx rate? p95 latency?"| PROM
+
+    %% ---- alert --------------------------------------------------------
+    PROM ==>|"rules fire"| AM
+    AM ==>|"sns publish via IRSA<br/>no static credentials anywhere"| SNS
+    SNS ==> MAIL
+
+    classDef new fill:#f3ecff,stroke:#6b3fa0,stroke-width:3px
+    classDef exposed fill:#ffe5e5,stroke:#c0392b,stroke-width:2px
+    classDef jenkins fill:#e3f0ff,stroke:#2563a8,stroke-width:2px
+    classDef app fill:#e6f7ee,stroke:#1d7a4c,stroke-width:2px
+    classDef ext fill:#f2f2f2,stroke:#888,stroke-width:1px
+
+    class PROM,AM,GRAF,OPER,KSM,NEX,SMA,SMJ,ALBG new
+    class ALBA exposed
+    class JC,ACI,ACD jenkins
+    class FE,BE,WK app
+    class OPS,USR,MAIL,SNS,KUBELET ext

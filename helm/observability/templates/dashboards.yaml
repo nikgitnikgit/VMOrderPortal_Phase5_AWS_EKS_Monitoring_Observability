@@ -1,0 +1,37 @@
+# Grafana dashboards, as ConfigMaps built from the chart's own dashboards/ directory.
+#
+# This is the whole of "observability as code" in one object. The Grafana
+# sidecar watches for ConfigMaps carrying the grafana_dashboard label, writes
+# their contents to disk, and Grafana provisions them. Nothing is imported
+# through the UI, and with persistence disabled a UI edit cannot survive a
+# restart -- so the file in Git is the only thing that decides what a panel
+# shows.
+#
+# .Files.Glob rather than one template per dashboard: adding a dashboard is
+# then a matter of dropping a .json file in the directory, and there is no
+# second place to remember to update.
+# NOTE: the path is relative to the CHART ROOT and cannot escape it.
+# .Files.Glob silently returns nothing for a path outside the chart, so a
+# dashboards directory at the top level of the repository would render zero
+# ConfigMaps and report success. That is why they live here.
+{{- range $path, $_ := .Files.Glob "dashboards/*.json" }}
+{{- $name := base $path | trimSuffix ".json" }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-dashboard-{{ $name }}
+  namespace: {{ $.Values.namespace }}
+  labels:
+    # The label the sidecar selects on. It and the sidecar's configuration in
+    # kube-prometheus-stack.values.yaml must agree: change one without the
+    # other and the ConfigMap is created, is perfectly valid, and is never
+    # loaded -- with no error anywhere.
+    {{ $.Values.grafana.dashboardLabel }}: {{ $.Values.grafana.dashboardLabelValue | quote }}
+    app.kubernetes.io/part-of: vm-order-portal
+  annotations:
+    grafana_folder: "VM Order Portal"
+data:
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+{{- end }}

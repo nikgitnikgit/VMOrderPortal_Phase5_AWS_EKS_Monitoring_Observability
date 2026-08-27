@@ -1,0 +1,84 @@
+# helm/worker/values.yaml
+image:
+  registry: ""                  # (deploy.sh)
+  repository: vm-order-worker
+  tag: "1.0.0"
+
+replicas: 2                     # OUR DESIGN DECISION: 2 for availability —
+                                # push-driven service, no duplicate-email risk,
+                                # survives node failure with zero downtime
+
+serviceAccount:
+  name: worker-sa
+  roleArn: ""                   # (deploy.sh) IRSA: SNS Publish + SES only
+
+service:
+  port: 5001
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 96Mi
+  limits:
+    cpu: 300m
+    memory: 192Mi
+
+hpa:
+  enabled: false                # DOCUMENTED DECISION: email volume is tiny;
+                                # autoscaling here would be decoration.
+  # Values below are inactive while enabled=false, but defined so that
+  # flipping the switch later produces a valid HPA immediately:
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPU: 70
+
+config:
+  AWS_REGION: us-east-1         # (deploy.sh)
+  DB_USER: vmadmin
+  DB_NAME: vmorders
+  PYTHONDONTWRITEBYTECODE: "1"
+
+# REVIEW FIX 2.2 — was the shared "app-secrets". One Secret per workload.
+# The worker legitimately needs all four keys: it publishes to SNS, sends the
+# SES confirmation, AND updates sns_sent/ses_sent on the order row in RDS.
+existingSecret: worker-secrets   # created by scripts/install-jenkins.sh, NOT by Helm
+
+networkPolicy:
+  enabled: true
+  vpcCidr: 10.23.0.0/16
+  # REVIEW FIX 4.6 — 5432 egress is allowed only to the DB subnets, not the
+  # whole VPC. Overridden per environment by Jenkinsfile-cd from
+  # `terraform output db_subnet_cidrs`; these are the defaults.
+  dbSubnetCidrs:
+    - 10.23.2.0/24
+    - 10.23.3.0/24
+
+# --- Phase 5: observability --------------------------------------------------
+monitoring:
+  # Guarded by a flag, and that is not decoration. A ServiceMonitor is a custom
+  # resource: on a cluster where the Prometheus Operator is not installed the
+  # CRD does not exist and `helm install` fails outright. A chart that cannot
+  # be installed without the monitoring stack is a chart that cannot be tested
+  # in isolation, so this defaults to on for the real deploy and can be turned
+  # off for a bare cluster.
+  enabled: true
+  # Scraped every 30s, matching the Prometheus global interval. Setting a
+  # DIFFERENT interval here is a classic way to make rate() lie: a 30s range
+  # over a 60s scrape has at most one sample and silently returns nothing.
+  interval: 30s
+  scrapeTimeout: 10s
+  # The namespace the scraper lives in. Used by the NetworkPolicy below to
+  # admit Prometheus to the metrics port and nothing else.
+  namespace: observability
+
+metricsPort: 9090          # NEVER 5001 - the probes own that one
+
+# Build identity, surfaced as app_build_info{version,git_sha,release}.
+# Jenkinsfile-cd overrides all three from the tag and commit it is deploying,
+# which is what lets a dashboard annotate a latency change with the release
+# that caused it and lets the CD gate assert the running pods report THIS
+# commit. Defaults are honest placeholders, never a fake version.
+build:
+  version: ""
+  gitSha: ""
+  release: ""

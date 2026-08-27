@@ -1,0 +1,819 @@
+// Jenkinsfile-cd — VM Order Portal, CD pipeline
+//
+// RESPONSIBILITY: take an image that CI already built and scanned, deploy it,
+// verify it, and roll back if verification fails.
+// EXPLICITLY NOT ALLOWED: building images, pushing to a registry, or changing
+// application code.
+//
+// This pipeline runs as ServiceAccount `jenkins-agent-cd`, which can manage
+// application objects in `devops-app` and nothing else. It has no ECR push
+// permission and no BuildKit container — it could not build an image if it
+// tried. The separation is enforced by RBAC and by the pod spec, not by
+// convention.
+//
+// It also cannot read Secrets. Helm normally stores release history as
+// Secrets, so we set HELM_DRIVER=configmap: Jenkins deploys an application
+// whose database password it is unable to read.
+
+pipeline {
+    agent {
+        kubernetes {
+            yaml """
+apiVersion: v1
+kind: Pod
+metadata:
+  labels:
+    jenkins/agent: "true"
+    pipeline: "cd"
+spec:
+  serviceAccountName: jenkins-agent-cd
+  securityContext:
+    fsGroup: 1000
+    runAsNonRoot: true
+  tolerations:
+    - key: "role"
+      operator: "Equal"
+      value: "jenkins"
+      effect: "NoSchedule"
+  nodeSelector:
+    eks.amazonaws.com/nodegroup: "${env.JENKINS_NODE_GROUP}"
+  containers:
+    # Note: no buildkit container. CD physically cannot build.
+    # The Kubernetes plugin injects this container automatically — it is the
+    # agent process that talks to the controller over JNLP. We declare it here
+    # ONLY to set a numeric runAsUser: the pod sets runAsNonRoot: true, and the
+    # inbound-agent image declares USER as the NAME "jenkins" rather than a UID.
+    # The kubelet cannot resolve a name to a number before start, so it refuses
+    # with "image has non-numeric user (jenkins), cannot verify user is
+    # non-root" and the build never begins.
+    # Everything else (image, JENKINS_SECRET, args) is still supplied by the
+    # plugin; declaring the name is enough to merge our securityContext in.
+    - name: jnlp
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+      resources:
+        requests: { cpu: "100m", memory: "256Mi" }
+        limits:   { cpu: "500m", memory: "512Mi" }
+    - name: tools
+      image: "${env.AGENT_TOOLS_IMAGE}"
+      command: ["sleep"]
+      args: ["infinity"]
+      resources:
+        requests: { cpu: "200m", memory: "512Mi" }
+        limits:   { cpu: "1",    memory: "1Gi" }
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        allowPrivilegeEscalation: false
+        capabilities:
+          drop: ["ALL"]
+        seccompProfile:
+          type: RuntimeDefault
+"""
+        }
+    }
+
+    parameters {
+        string(name: 'IMAGE_TAG', defaultValue: '',
+               description: 'Immutable image tag produced by CI (git short SHA). "latest" is rejected.')
+        // ENFORCED, not decorative: 'Verify image identity in registry'
+        // compares each of these to what ECR actually serves for IMAGE_TAG and
+        // fails the build on mismatch. Leave blank only for a manual re-deploy
+        // of an older tag, where there is no CI run to supply them — the build
+        // then says out loud that it trusted the tag alone.
+        string(name: 'BACKEND_DIGEST',  defaultValue: '',
+               description: 'sha256:... recorded by CI. Compared against ECR; mismatch fails the deploy.')
+        string(name: 'FRONTEND_DIGEST', defaultValue: '',
+               description: 'sha256:... recorded by CI. Compared against ECR; mismatch fails the deploy.')
+        string(name: 'WORKER_DIGEST',   defaultValue: '',
+               description: 'sha256:... recorded by CI. Compared against ECR; mismatch fails the deploy.')
+        string(name: 'CI_BUILD',        defaultValue: '', description: 'Originating CI build number (traceability)')
+        string(name: 'GIT_COMMIT_SHA',  defaultValue: '', description: 'Originating git commit (traceability)')
+        choice(name: 'TARGET_NAMESPACE', choices: ['devops-app'],
+               description: 'Deployment target. Restricted by RBAC to this namespace.')
+    }
+
+    options {
+        timeout(time: 30, unit: 'MINUTES')
+        // Prevents two deployments racing into the same environment.
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timestamps()
+    }
+
+    environment {
+        // Helm stores release history as Secrets by default, which would need
+        // list/get on secrets. RBAC cannot scope `list` to one named object,
+        // so granting it would expose the application Secrets. The configmap driver keeps
+        // history in ConfigMaps, which CD is already permitted to manage.
+        HELM_DRIVER = 'configmap'
+    }
+
+    stages {
+
+        stage('Validate input') {
+            steps {
+                script {
+                    def tag = params.IMAGE_TAG?.trim()
+
+                    if (!tag) {
+                        error('IMAGE_TAG is required. CD deploys an existing image; it does not build one.')
+                    }
+                    if (tag.toLowerCase() in ['latest', 'master', 'main']) {
+                        error("IMAGE_TAG '${tag}' is not immutable. Supply the git short SHA produced by CI.")
+                    }
+                    if (!(tag ==~ /^[0-9a-f]{7,40}$/)) {
+                        error("IMAGE_TAG '${tag}' does not look like a git SHA. Refusing to deploy an unverified tag.")
+                    }
+                    if (params.TARGET_NAMESPACE != 'devops-app') {
+                        error("Namespace '${params.TARGET_NAMESPACE}' is not permitted by RBAC.")
+                    }
+
+                    // REVIEW FIX 2.4 — the digests are now ENFORCED further down
+                    // ('Verify image identity in registry'), so a malformed one
+                    // is no longer harmless decoration: it would fail as a
+                    // mismatch and read like the registry had been tampered
+                    // with. Reject the wrong SHAPE here, where the message can
+                    // say what is actually wrong. Empty stays legal — a manual
+                    // re-deploy has no CI to supply digests.
+                    // A plain for-loop, not .each { }: Jenkins CPS-transforms
+                    // pipeline Groovy, and closure-based iteration is the
+                    // classic source of NotSerializableException / silently
+                    // skipped bodies in that transform. `for` is always safe.
+                    for (String p : ['BACKEND_DIGEST', 'FRONTEND_DIGEST', 'WORKER_DIGEST']) {
+                        String d = params[p]?.trim()
+                        if (d && !(d ==~ /^sha256:[0-9a-f]{64}$/)) {
+                            error("${p} '${d}' is not a valid image digest. " +
+                                  'Expected sha256: followed by 64 hex characters, ' +
+                                  'exactly as CI records it in image-manifest.json.')
+                        }
+                    }
+
+                    env.TAG = tag
+                    // Who / what / where — printed on every deployment.
+                    def cause = currentBuild.getBuildCauses()*.shortDescription.join(', ')
+                    echo """
+======================= CD DEPLOYMENT =======================
+  Triggered by    : ${cause}
+  CD build        : ${env.BUILD_NUMBER}
+  Originating CI  : ${params.CI_BUILD ?: '(manual run)'}
+  Git commit      : ${params.GIT_COMMIT_SHA ?: '(not supplied)'}
+  Image tag       : ${env.TAG}
+  backend digest  : ${params.BACKEND_DIGEST  ?: '(none — tag trust only)'}
+  frontend digest : ${params.FRONTEND_DIGEST ?: '(none — tag trust only)'}
+  worker digest   : ${params.WORKER_DIGEST   ?: '(none — tag trust only)'}
+  Cluster         : ${env.CLUSTER_NAME}
+  Namespace       : ${params.TARGET_NAMESPACE}
+=============================================================
+"""
+                    currentBuild.description = "tag ${env.TAG} → ${params.TARGET_NAMESPACE} (CI #${params.CI_BUILD ?: '-'})"
+                }
+            }
+        }
+
+        stage('Verify image identity in registry') {
+            steps {
+                container('tools') {
+                    // REVIEW FIX 2.4 — ENFORCE the digest, do not just print it.
+                    //
+                    // This stage used to call describe-images, print
+                    // imageDetails[0].imageDigest, and move on. The registry's
+                    // real digest was fetched and displayed on every deployment
+                    // — and then thrown away, never compared against the digest
+                    // CI actually scanned and handed over.
+                    //
+                    // That made the three *_DIGEST parameters decorative: a
+                    // receipt printed on the wall rather than a lock on the door.
+                    // The only thing standing between "CI scanned it" and "this
+                    // is what we deploy" was ECR tag immutability — a setting in
+                    // another system, one Terraform flag away from being off, and
+                    // one this pipeline had no way to notice the loss of.
+                    //
+                    // With the comparison the guarantee lives in the pipeline: if
+                    // the tag ever resolves to an image CI did not scan, CD fails
+                    // HERE — before the approval gate, before Helm, before
+                    // anything reaches the cluster. Nothing changed, so nothing
+                    // needs rolling back.
+                    //
+                    // Passed via withEnv rather than Groovy interpolation so the
+                    // sh body stays a single-quoted string: a parameter can never
+                    // be spliced into the script text and executed as shell.
+                    withEnv([
+                        "EXPECT_frontend=${params.FRONTEND_DIGEST?.trim() ?: ''}",
+                        "EXPECT_backend=${params.BACKEND_DIGEST?.trim() ?: ''}",
+                        "EXPECT_worker=${params.WORKER_DIGEST?.trim() ?: ''}"
+                    ]) {
+                        sh '''
+                            set -e
+                            MISMATCH=0
+                            UNVERIFIED=0
+
+                            for svc in frontend backend worker; do
+                                # A tag that does not exist makes describe-images
+                                # exit non-zero, which `set -e` turns into a stage
+                                # failure. That is the original "does this tag
+                                # exist at all" check, unchanged.
+                                ACTUAL=$(aws ecr describe-images \
+                                    --repository-name "vm-order-${svc}" \
+                                    --image-ids imageTag="${TAG}" \
+                                    --region "$AWS_REGION" \
+                                    --query 'imageDetails[0].imageDigest' --output text)
+
+                                # Plain case, not `eval` indirection or bash's
+                                # ${!name}: the sh step runs /bin/sh (dash on
+                                # Debian), which has no indirect expansion, and
+                                # an eval here would depend on backslash
+                                # escaping surviving Groovy's string literal
+                                # intact — a silent breakage waiting to happen.
+                                case "$svc" in
+                                    frontend) EXPECT="$EXPECT_frontend" ;;
+                                    backend)  EXPECT="$EXPECT_backend"  ;;
+                                    worker)   EXPECT="$EXPECT_worker"   ;;
+                                esac
+
+                                if [ -z "$EXPECT" ]; then
+                                    # A manual re-deploy of an older tag from
+                                    # "Build with Parameters" has no CI to supply
+                                    # digests, and that has to keep working. But it
+                                    # is a WEAKER check, and this project's rule is
+                                    # that a weaker check never gets to look like a
+                                    # stronger one.
+                                    echo "  ${svc}  ${ACTUAL}"
+                                    echo "      NO CI DIGEST SUPPLIED — trusting ECR tag immutability alone"
+                                    UNVERIFIED=1
+                                elif [ "$EXPECT" = "$ACTUAL" ]; then
+                                    echo "  ${svc}  ${ACTUAL}  MATCH"
+                                else
+                                    echo "  ${svc}  MISMATCH"
+                                    echo "      CI built and scanned : ${EXPECT}"
+                                    echo "      registry now serves  : ${ACTUAL}"
+                                    MISMATCH=1
+                                fi
+                            done
+
+                            if [ "$MISMATCH" -ne 0 ]; then
+                                echo "" >&2
+                                echo "ERROR: the registry does not serve the image CI scanned." >&2
+                                echo "" >&2
+                                echo "  Tag ${TAG} now resolves to a different image than the one" >&2
+                                echo "  application-ci built, scanned with Trivy and handed over." >&2
+                                echo "  Refusing to deploy an image that passed no scan." >&2
+                                echo "" >&2
+                                echo "  First thing to check is whether ECR tag immutability is" >&2
+                                echo "  still enabled:" >&2
+                                echo "    aws ecr describe-repositories --repository-names vm-order-backend \\\\" >&2
+                                echo "        --query 'repositories[0].imageTagMutability'" >&2
+                                exit 1
+                            fi
+
+                            if [ "$UNVERIFIED" -ne 0 ]; then
+                                echo ""
+                                echo "NOTE: this deployment was verified by tag, not by digest."
+                            fi
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Manifest validation') {
+            steps {
+                container('tools') {
+                    sh '''
+                        set -e
+                        helm lint helm/backend helm/worker helm/frontend
+
+                        echo "--- server-side dry run ---"
+                        for c in backend worker frontend; do
+                            helm upgrade --install "$c" "helm/$c" \
+                                --namespace "$TARGET_NAMESPACE" \
+                                --set image.registry="$ECR_REGISTRY" \
+                                --set image.tag="$TAG" \
+                                --dry-run --debug > "/tmp/render-$c.txt" 2>&1 \
+                              || { tail -30 "/tmp/render-$c.txt"; exit 1; }
+                            echo "  $c renders OK"
+                        done
+                    '''
+                }
+            }
+        }
+
+        stage('Approval') {
+            steps {
+                timeout(time: 15, unit: 'MINUTES') {
+                    input message: "Deploy tag ${env.TAG} to ${params.TARGET_NAMESPACE}?",
+                          ok: 'Deploy'
+                }
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                // AUDIT FIX -- the marker the rollback in post{failure} reads.
+                //
+                // Without it that block rolled back UNCONDITIONALLY. A failure
+                // in Validate input, Verify image identity or Manifest
+                // validation -- none of which touch the cluster -- reverted the
+                // currently healthy production release by one revision. A
+                // typo'd IMAGE_TAG was enough to break production.
+                //
+                // Set BEFORE the first helm upgrade, not after: a helm upgrade
+                // that fails halfway has already changed the release and does
+                // need rolling back.
+                script { env.DEPLOY_STARTED = 'true' }
+                container('tools') {
+                    sh '''
+                        set -e
+                        helm upgrade --install backend helm/backend \
+                            --namespace "$TARGET_NAMESPACE" \
+                            --set image.registry="$ECR_REGISTRY" \
+                            --set image.tag="$TAG" \
+                            --set build.version="$TAG" \
+                            --set build.gitSha="${GIT_COMMIT_SHA:-$TAG}" \
+                            --set build.release="cd-${BUILD_NUMBER}" \
+                            --set serviceAccount.roleArn="$BACKEND_ROLE_ARN" \
+                            --set config.AWS_REGION="$AWS_REGION" \
+                            --set config.S3_BUCKET="$S3_BUCKET" \
+                            --set networkPolicy.vpcCidr="$VPC_CIDR" \
+                            --set "networkPolicy.dbSubnetCidrs={$DB_SUBNET_CIDRS}" \
+                            --wait --timeout 5m
+
+                        helm upgrade --install worker helm/worker \
+                            --namespace "$TARGET_NAMESPACE" \
+                            --set image.registry="$ECR_REGISTRY" \
+                            --set image.tag="$TAG" \
+                            --set build.version="$TAG" \
+                            --set build.gitSha="${GIT_COMMIT_SHA:-$TAG}" \
+                            --set build.release="cd-${BUILD_NUMBER}" \
+                            --set serviceAccount.roleArn="$WORKER_ROLE_ARN" \
+                            --set config.AWS_REGION="$AWS_REGION" \
+                            --set networkPolicy.vpcCidr="$VPC_CIDR" \
+                            --set "networkPolicy.dbSubnetCidrs={$DB_SUBNET_CIDRS}" \
+                            --wait --timeout 5m
+
+                        # networkPolicy.vpcCidr is passed explicitly rather
+                        # than trusting the chart default: the ALB connects
+                        # from inside the VPC, and a wrong CIDR here silently
+                        # blocks all traffic (healthy pods, 504 at the ALB).
+                        # REVIEW FIX 4.4 — pass the ACM certificate so the app
+                        # ALB serves HTTPS and redirects 80 -> 443. Empty is
+                        # allowed: the chart falls back to HTTP-only rather
+                        # than failing, so a cluster without a certificate
+                        # still deploys.
+                        helm upgrade --install frontend helm/frontend \
+                            --namespace "$TARGET_NAMESPACE" \
+                            --set image.registry="$ECR_REGISTRY" \
+                            --set image.tag="$TAG" \
+                            --set networkPolicy.vpcCidr="$VPC_CIDR" \
+                            --set ingress.certificateArn="${APP_CERT_ARN:-}" \
+                            --wait --timeout 5m
+                    '''
+                }
+            }
+        }
+
+        stage('Rollout') {
+            steps {
+                container('tools') {
+                    sh '''
+                        set -e
+                        for d in backend worker frontend; do
+                            kubectl rollout status "deployment/$d" \
+                                -n "$TARGET_NAMESPACE" --timeout=300s
+                        done
+                    '''
+                }
+            }
+        }
+
+        stage('Verify running version') {
+            steps {
+                container('tools') {
+                    // Proves the cluster is running the version we asked for,
+                    // not a leftover from a previous release.
+                    sh '''
+                        set -e
+                        echo "--- images actually running ---"
+                        kubectl get pods -n "$TARGET_NAMESPACE" \
+                            -o jsonpath='{range .items[*]}{.metadata.name}{"\\t"}{.spec.containers[*].image}{"\\n"}{end}'
+
+                        MISMATCH=0
+                        for svc in frontend backend worker; do
+                            RUNNING=$(kubectl get deployment "$svc" -n "$TARGET_NAMESPACE" \
+                                -o jsonpath='{.spec.template.spec.containers[0].image}')
+                            case "$RUNNING" in
+                                *:"$TAG") echo "  $svc OK ($RUNNING)" ;;
+                                *) echo "  $svc MISMATCH: running $RUNNING, expected tag $TAG"; MISMATCH=1 ;;
+                            esac
+                        done
+                        [ "$MISMATCH" -eq 0 ] || exit 1
+
+                        echo "--- resources ---"
+                        kubectl get deployment,replicaset,pod,service,ingress,hpa -n "$TARGET_NAMESPACE"
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke test') {
+            steps {
+                container('tools') {
+                    // Goes through the frontend, not straight to the backend:
+                    // the backend NetworkPolicy accepts traffic only from pods
+                    // labelled app=frontend, so a direct call would be refused.
+                    // Testing via nginx also exercises the real request path.
+                    sh '''
+                        set -e
+                        FRONTEND_IP=$(kubectl get svc frontend -n "$TARGET_NAMESPACE" \
+                            -o jsonpath='{.spec.clusterIP}')
+
+                        echo "--- 1/3 nginx serving ---"
+                        curl -sf --max-time 10 "http://${FRONTEND_IP}:8080/healthz" > /dev/null
+                        echo "    /healthz OK"
+
+                        echo "--- 2/3 nginx -> backend proxy ---"
+                        curl -sf --max-time 10 "http://${FRONTEND_IP}:8080/api/health" > /dev/null
+                        echo "    /api/health OK"
+
+                        echo "--- 3/3 public ALB ---"
+                        # REVIEW FIX 3.1b — this check used to be incapable of
+                        # failing. Both branches let a completely unreachable
+                        # application report a green deploy:
+                        #   * empty $ALB      -> logged and passed over, pass
+                        #   * 12 failed curls -> loop just ends, pass
+                        # `set -e` does not help: a curl that fails inside an
+                        # `if` condition is not an error, it is the false branch.
+                        # This is the same false-success bug the phase 3 review
+                        # found in deploy.sh, reappearing in a new place — and
+                        # here it is worse, because it means the post{failure}
+                        # rollback can never fire on the exact failure it exists
+                        # to catch.
+                        ALB=$(kubectl get ingress -n "$TARGET_NAMESPACE" \
+                            -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}')
+
+                        if [ -z "$ALB" ]; then
+                            echo "    FAIL: the Ingress has no load balancer address."
+                            echo "    The ALB controller never provisioned one. Check:"
+                            echo "      kubectl describe ingress -n $TARGET_NAMESPACE"
+                            echo "      kubectl logs -n kube-system deployment/aws-load-balancer-controller"
+                            exit 1
+                        fi
+
+                        # A brand-new ALB is NOT reachable the moment the
+                        # Ingress reports a hostname. The controller fills in
+                        # status.loadBalancer as soon as the ALB is CREATED,
+                        # but it then has to reach "active", register the pod
+                        # IPs as targets, pass health checks, and — slowest of
+                        # all — have its DNS name propagate. On a first deploy
+                        # that routinely runs 3-5 minutes.
+                        #
+                        # The old budget was 12 x 10s = 2 minutes, which
+                        # contradicted this comment's own "2-3 minutes"
+                        # estimate. It expired while DNS was still propagating
+                        # and rolled back a deployment whose in-cluster checks
+                        # (1/3 and 2/3 above) had both just passed. Symptom:
+                        # every curl failing instantly rather than timing out,
+                        # which is DNS refusing to resolve, not the ALB
+                        # refusing to serve.
+                        #
+                        # This does NOT weaken REVIEW FIX 3.1b: ALB_OK stays 0
+                        # unless a request genuinely succeeds, the budget is
+                        # still bounded, and it still exits 1 and rolls back.
+                        # Only the budget grew. See T14.59.
+                        # Since REVIEW FIX 4.4 the ALB redirects 80 -> 443, and
+                        # `curl -sf` treats a 301 as SUCCESS — --fail only
+                        # trips on >= 400. The old probe therefore went green
+                        # on the redirect alone, having never reached a pod:
+                        # the ALB emits that redirect at the LISTENER, before
+                        # it selects a target, so this passed even with every
+                        # pod dead. That is the same false-success shape
+                        # REVIEW FIX 3.1b removed, reappearing one layer down.
+                        #
+                        # So: follow the redirect and demand exactly 200.
+                        # -k is required and safe here — create-cert.sh issues
+                        # a deliberately SELF-SIGNED certificate, so chain
+                        # verification can never succeed. This check asks "does
+                        # the app serve?", not "is the issuer trusted?".
+                        # See T14.60.
+                        ALB_OK=0
+                        ATTEMPTS=30
+                        for i in $(seq 1 "$ATTEMPTS"); do
+                            CODE=$(curl -s -o /dev/null -w '%{http_code}' -L -k \
+                                --max-time 10 "http://${ALB}/healthz" 2>/dev/null || echo 000)
+                            if [ "$CODE" = "200" ]; then
+                                echo "    public URL OK: http://${ALB} (200 after redirect)"
+                                ALB_OK=1
+                                break
+                            fi
+                            if getent hosts "$ALB" > /dev/null 2>&1; then
+                                echo "    DNS resolves, ALB returned $CODE, waiting ($i/$ATTEMPTS)"
+                            else
+                                echo "    waiting for ALB DNS to propagate ($i/$ATTEMPTS)"
+                            fi
+                            sleep 10
+                        done
+
+                        if [ "$ALB_OK" -ne 1 ]; then
+                            echo "    FAIL: http://${ALB}/healthz never returned 200 after 5 minutes."
+                            echo "    The deployment is NOT serving traffic. Rolling back."
+                            exit 1
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Monitoring gate') {
+            steps {
+                container('tools') {
+                    // THE POST-DEPLOY GATE.
+                    //
+                    // Everything before this proved the release was DEPLOYED:
+                    // the digest matched, the rollout completed, the smoke test
+                    // got a 200. None of that proves it is WORKING -- a smoke
+                    // test is one request, and one request succeeding is not
+                    // evidence about a service.
+                    //
+                    // This asks Prometheus four questions over a three-minute
+                    // window: are all targets up, are the pods reporting THIS
+                    // commit, is the 5xx ratio inside the SLO, is p95 inside
+                    // the SLO. Any answer of "no" -- or any answer of "I do not
+                    // know" -- fails the build, and post{failure} below then
+                    // collects diagnostics and rolls back.
+                    //
+                    // The logic lives in scripts/monitoring-gate.sh so it can
+                    // be linted and unit-tested. It is: tests/run_all.sh T18
+                    // drives it against a fake Prometheus and asserts it fails
+                    // on empty results, on a 200-with-error body, and on a
+                    // retry loop that runs out.
+                    //
+                    // Parameters go in through withEnv, never spliced into the
+                    // script text -- the same rule the digests follow.
+                    withEnv([
+                        "GATE_SHA=${params.GIT_COMMIT_SHA ?: env.TAG}",
+                        "GATE_NS=${params.TARGET_NAMESPACE}",
+                    ]) {
+                        sh '''
+                            set -e
+                            ./scripts/monitoring-gate.sh "$GATE_SHA" "$GATE_NS"
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Record deployment') {
+            steps {
+                // AUDIT FIX -- UNSTABLE, not FAILURE.
+                //
+                // This stage runs AFTER the rollout, the smoke test and the
+                // monitoring gate have all passed: the release is verified good
+                // and is serving traffic. It only writes evidence to S3. With
+                // `set -e` and a plain stage, a transient S3 error here marked
+                // the build FAILED, which reached post{failure} and ROLLED BACK
+                // a deployment that had passed every check — undoing a good
+                // release because a log file could not be uploaded.
+                //
+                // Failing to collect evidence is worth knowing about, so it is
+                // not swallowed; it is just not worth reverting production for.
+                // UNSTABLE does not trigger post{failure}.
+                catchError(buildResult: 'UNSTABLE', stageResult: 'UNSTABLE',
+                           message: 'the deployment succeeded but evidence collection failed') {
+                container('tools') {
+                    sh '''
+                        set -e
+                        {
+                          echo "cd_build=${BUILD_NUMBER}"
+                          echo "ci_build=${CI_BUILD:-manual}"
+                          echo "git_commit=${GIT_COMMIT_SHA:-unknown}"
+                          echo "image_tag=${TAG}"
+                          # The digests this deployment was VERIFIED against, not
+                          # just the ones it was handed. 'Verify image identity in
+                          # registry' has already failed the build if any of these
+                          # disagreed with ECR, so their presence here is proof the
+                          # comparison ran and passed. "(none)" means the deploy was
+                          # trusted by tag alone -- a manual re-deploy with no CI.
+                          echo "frontend_digest=${FRONTEND_DIGEST:-(none)}"
+                          echo "backend_digest=${BACKEND_DIGEST:-(none)}"
+                          echo "worker_digest=${WORKER_DIGEST:-(none)}"
+                          # Proof the gate ran AND passed. Without this a
+                          # deployment record cannot distinguish "verified
+                          # against live metrics" from "rolled out and hoped".
+                          echo "monitoring_gate=passed"
+                          echo "namespace=${TARGET_NAMESPACE}"
+                          echo "cluster=${CLUSTER_NAME}"
+                          echo "deployed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                        } > deployment-record.txt
+
+                        kubectl get deployment,pod,service,ingress,hpa \
+                            -n "$TARGET_NAMESPACE" > cluster-state.txt
+                        HELM_DRIVER=configmap helm list -n "$TARGET_NAMESPACE" > helm-releases.txt
+
+                        aws s3 cp deployment-record.txt "s3://${S3_BUCKET}/deployments/${TAG}/"
+                        aws s3 cp cluster-state.txt      "s3://${S3_BUCKET}/deployments/${TAG}/"
+                        aws s3 cp helm-releases.txt      "s3://${S3_BUCKET}/deployments/${TAG}/"
+
+                        echo "--- evidence in S3 ---"
+                        aws s3 ls "s3://${S3_BUCKET}/deployments/${TAG}/"
+                    '''
+                }
+                }   // end catchError: evidence failure must not roll back a good release
+            }
+        }
+    }
+
+    post {
+        failure {
+            // AUDIT FIX -- guarded, so that the notification below can still be
+            // sent when there is no agent pod.
+            //
+            // notify() is itself wrapped in try/catch specifically for the
+            // "build died before the agent pod existed" case. But this
+            // container('tools') block runs FIRST in the same post condition
+            // and was not guarded, so in exactly that scenario -- the tools
+            // image fails to pull, or no node tolerates the taint -- it threw
+            // MissingContextVariableException and the pipeline never reached
+            // notify(). The careful guard was dead code in the one situation it
+            // was written for, and the failure went out silently.
+            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE',
+                       message: 'diagnostics/rollback could not run (no agent pod?)') {
+            container('tools') {
+                // Collect diagnostics BEFORE rolling back, or the evidence of
+                // what went wrong disappears with the failed ReplicaSet.
+                sh '''
+                    echo "=================== FAILURE DIAGNOSTICS ==================="
+                    kubectl get pods -n "$TARGET_NAMESPACE" -o wide || true
+                    echo "--- recent events ---"
+                    kubectl get events -n "$TARGET_NAMESPACE" \
+                        --sort-by=.metadata.creationTimestamp | tail -30 || true
+                    for d in backend worker frontend; do
+                        echo "--- logs: $d ---"
+                        kubectl logs "deployment/$d" -n "$TARGET_NAMESPACE" --tail=40 || true
+                    done
+
+                    # AUDIT FIX 1 — do not roll back a release this build never
+                    # touched. DEPLOY_STARTED is set at the top of the Deploy
+                    # stage; if we failed before that, the cluster is exactly as
+                    # we found it and rolling back would revert a HEALTHY
+                    # release for a mistake made in a parameter field.
+                    if [ "${DEPLOY_STARTED:-false}" != "true" ]; then
+                        echo "=================== NO ROLLBACK NEEDED ==================="
+                        echo "  This build failed before the Deploy stage, so it never"
+                        echo "  changed the cluster. The running release is untouched."
+                        exit 0
+                    fi
+
+                    echo "=================== ROLLING BACK ==================="
+                    # AUDIT FIX 2 — a rollback that FAILS must not print the
+                    # reassuring message.
+                    #
+                    # This used to be `helm rollback ... 2>/dev/null && echo
+                    # "rolled back" || echo "no previous revision (first
+                    # install) — nothing to roll back"`, which discards stderr
+                    # and maps EVERY non-zero exit to "nothing to roll back". A
+                    # release locked by another operation, a missing history, an
+                    # API rejection — all of them told the operator the
+                    # environment had been restored while the broken release
+                    # kept serving traffic.
+                    #
+                    # "No previous revision" is now established by asking, not
+                    # by inferring it from a failure.
+                    ROLLBACK_FAILED=""
+                    for r in frontend worker backend; do
+                        REVS=$(HELM_DRIVER=configmap helm history "$r" -n "$TARGET_NAMESPACE" \
+                                 -o json 2>/dev/null | grep -c '"revision"' || echo 0)
+                        if [ "${REVS:-0}" -lt 2 ]; then
+                            echo "  $r: no previous revision (first install) — nothing to roll back"
+                            continue
+                        fi
+                        # --wait, so "rolled back" means the old pods are
+                        # actually serving, not merely that Helm accepted it.
+                        if HELM_DRIVER=configmap helm rollback "$r" -n "$TARGET_NAMESPACE" \
+                               --wait --timeout 5m; then
+                            echo "  rolled back $r"
+                        else
+                            echo "  !! ROLLBACK FAILED for $r — it is STILL RUNNING THE BAD RELEASE"
+                            ROLLBACK_FAILED="${ROLLBACK_FAILED} $r"
+                        fi
+                    done
+                    if [ -n "$ROLLBACK_FAILED" ]; then
+                        echo ""
+                        echo "  MANUAL INTERVENTION REQUIRED:${ROLLBACK_FAILED}"
+                        echo "  These releases were NOT restored. Do not assume the"
+                        echo "  environment is back to its previous state."
+                    fi
+
+                    echo ""
+                    echo "Manual rollback, if needed:"
+                    echo "  HELM_DRIVER=configmap helm history backend -n $TARGET_NAMESPACE"
+                    echo "  HELM_DRIVER=configmap helm rollback backend <REVISION> -n $TARGET_NAMESPACE"
+                '''
+            }
+            }   // end catchError guarding the diagnostics/rollback block
+
+            // REVIEW FIX 3.1a — this notification used to live in a SECOND
+            // `failure { }` block further down. Declarative Pipeline forbids
+            // duplicate post conditions and rejects the whole Jenkinsfile at
+            // parse time with "Duplicate build condition name: failure", so
+            // application-cd could never have started a single build.
+            // Merged here, after the diagnostics and rollback above, so the
+            // email is sent once and only once the cleanup has run.
+            notify("DEPLOY FAILED - ${env.TAG} to ${params.TARGET_NAMESPACE}", """Deployment failed and a rollback was attempted.
+
+  Image tag : ${env.TAG}
+  Namespace : ${params.TARGET_NAMESPACE}
+  Console   : ${env.BUILD_URL}console
+
+Events and pod logs were collected before the rollback and are in the console
+output. To roll back manually:
+  HELM_DRIVER=configmap helm history backend -n ${params.TARGET_NAMESPACE}
+  HELM_DRIVER=configmap helm rollback backend <REV> -n ${params.TARGET_NAMESPACE}
+"""
+            )
+        }
+        success {
+            notify("Deployed ${env.TAG} to ${params.TARGET_NAMESPACE}", """Deployment succeeded.
+
+  Image tag  : ${env.TAG}
+  Namespace  : ${params.TARGET_NAMESPACE}
+  Cluster    : ${env.CLUSTER_NAME}
+  CD build   : ${env.BUILD_NUMBER}
+  From CI    : ${params.CI_BUILD ?: 'manual run'}
+  Commit     : ${params.GIT_COMMIT_SHA ?: 'not supplied'}
+
+  ${env.BUILD_URL}
+"""
+            )
+        }
+        always {
+            archiveArtifacts artifacts: 'deployment-record.txt,cluster-state.txt,helm-releases.txt',
+                             allowEmptyArchive: true
+            cleanWs(deleteDirs: true, notFailBuild: true)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// notify — build notifications without a stored secret.
+//
+// Replaces emailext. The mailer was pointed at SES SMTP on port 587, which the
+// jenkins-controller NetworkPolicy never permitted (its only internet egress
+// is 443), so every send failed with "SMTP connection error". It could not
+// have worked even with the port open: no SMTP credential was configured
+// anywhere, and the create-smtp-secret.sh referenced in configure-jenkins.sh
+// does not exist. email-ext never fails a build over a delivery failure, so
+// the stage stayed green while nothing was ever delivered.
+//
+// SNS instead: the topic already carries the email subscription, it is reached
+// over HTTPS 443 (already allowed for agents), and it is authorised by IRSA —
+// so no SMTP username and password have to exist. That is what the bonus asks
+// for: notifications "without exposing secrets".
+//
+// A publish failure marks the build UNSTABLE rather than passing silently or
+// failing the deploy. A notification is not worth failing a good deployment
+// over, but it must never again look like it succeeded when it did not.
+def notify(String subject, String message) {
+    // container('tools') needs a node context. post{} blocks run WITHOUT one
+    // when the build died before the agent pod existed -- a Groovy error in
+    // the pod YAML does exactly that, and it is the case where a notification
+    // matters most. emailext ran on the controller and never needed a node, so
+    // moving to an agent-side publish introduced this exposure.
+    //
+    // Without the guard the post block throws
+    //   MissingContextVariableException: Required context class hudson.model.Node
+    // which is how a real build already failed here once.
+    try {
+        container('tools') {
+            withEnv(["NOTIFY_SUBJECT=${subject}", "NOTIFY_MESSAGE=${message}"]) {
+                def rc = sh(returnStatus: true, script: '''
+                    if [ -z "${SNS_TOPIC_ARN:-}" ]; then
+                        echo "SNS_TOPIC_ARN is not set — cannot notify."
+                        exit 1
+                    fi
+                    aws sns publish \
+                        --topic-arn "$SNS_TOPIC_ARN" \
+                        --region "$AWS_REGION" \
+                        --subject "$NOTIFY_SUBJECT" \
+                        --message "$NOTIFY_MESSAGE" \
+                        --output text > /dev/null
+                    echo "notification published to $SNS_TOPIC_ARN"
+                ''')
+                if (rc != 0) {
+                    unstable("notification failed (aws sns publish exit ${rc})")
+                }
+            }
+        }
+    } catch (Exception e) {
+        // No agent to publish from. Say so loudly in the log and mark the build
+        // UNSTABLE rather than letting the post block explode, which would bury
+        // the ORIGINAL failure behind a stack trace.
+        echo "NOTIFICATION NOT SENT — no agent context (the build failed before the pod started). Subject was: ${subject}"
+        unstable("notification could not be sent: no agent context")
+    }
+}

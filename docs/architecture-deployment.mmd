@@ -1,0 +1,114 @@
+%% docs/architecture-deployment.mmd — Deployment View
+%% What runs where, what is exposed, and which identity holds which permission.
+%% Three trust zones: INTERNET (no AWS credentials), the VPC 10.23.0.0/16 (the
+%% only place project compute runs), and AWS managed services reached over AWS
+%% APIs from inside it. RDS is drawn inside the VPC because it has a DB subnet
+%% group; ECR, S3, SNS/SES and the Kubernetes API server are outside it.
+
+flowchart TB
+
+    subgraph NET["INTERNET"]
+        DEV(["Developer"])
+        GH["GitHub<br/>repository + webhook"]
+        USR(["End user"])
+    end
+
+    DEV -->|git push| GH
+    DEV -->|"Grafana login"| ALBG
+
+    subgraph VPC["VPC 10.23.0.0/16 — two availability zones"]
+
+        subgraph PUB["PUBLIC SUBNETS 10.23.1.0/24 · 10.23.5.0/24"]
+            ALBJ["<b>ALB — Jenkins</b><br/>HTTPS 443, ACM certificate<br/>inbound-cidrs = your IP /32 + GitHub hooks"]
+            ALBA["<b>ALB — application</b><br/>HTTPS 443, ACM certificate<br/>HTTP 80 → 443 redirect"]
+            ALBG["<b>ALB — Grafana</b><br/>HTTPS 443, ACM certificate<br/>inbound-cidrs = your IP /32"]
+        end
+
+        subgraph JN["PRIVATE SUBNETS · node group jenkins-nodes — 1 x m7i-flex.large — TAINTED role=jenkins"]
+            SVCJ["Service: jenkins<br/>ClusterIP :8080"]
+            JC["<b>jenkins-0</b> · controller<br/>numExecutors = 0<br/>SA: jenkins"]
+            PVC[("PVC 8Gi<br/>EBS gp2")]
+            CFG["<b>JCasC + Job DSL</b><br/>jenkins/values.yaml · seed.groovy<br/>pinned chart · declared plugins"]
+            JOBS["<b>application-ci</b> · multibranch<br/><b>application-cd</b> · parameterized<br/><i>created as code, never in the UI</i>"]
+            ACI["<b>CI agent pod</b> · ephemeral<br/>tools · buildkit · trivy<br/>SA: jenkins-agent-ci<br/><i>no deploy permission</i>"]
+            ACD["<b>CD agent pod</b> · ephemeral<br/>tools only, no builder<br/>SA: jenkins-agent-cd<br/><i>no push permission</i>"]
+        end
+
+        subgraph AN["PRIVATE SUBNETS · node group app-nodes — 3 x t3.small — namespace devops-app"]
+            FE["<b>frontend</b> x2<br/>nginx :8080"]
+            BE["<b>backend</b> x2<br/>Flask :5000"]
+            WK["<b>worker</b> x2<br/>Flask :5001"]
+            SEC[["<b>Secrets: backend-secrets · worker-secrets</b><br/>one per workload, not one shared<br/>DB password · SNS topic · SES sender<br/>Jenkins cannot read either of them"]]
+        end
+
+        subgraph MN["PRIVATE SUBNETS · node group monitoring-nodes — 1 x m7i-flex.large — TAINTED role=monitoring"]
+            OBS["<b>namespace: observability</b><br/>Prometheus · Grafana · Alertmanager<br/>kube-state-metrics · operator<br/><i>scrapes every namespace; only Grafana is exposed</i>"]
+        end
+
+        RDS[("<b>RDS PostgreSQL</b><br/>DB SUBNETS 10.23.2.0/24 · 10.23.3.0/24<br/>no route to the internet")]
+
+    end
+
+    K8S["<b>Kubernetes API server</b> · EKS control plane<br/><i>AWS-managed, outside the VPC</i><br/>authenticates ServiceAccount tokens<br/>authorises every request through RBAC"]
+
+    subgraph AWS["AWS MANAGED SERVICES — outside the VPC"]
+        ECR[("ECR · 4 repositories<br/>IMMUTABLE tags")]
+        S3[("S3<br/>orders / builds / deployments")]
+        MSG["SNS + SES"]
+    end
+
+    %% --- ingress from the internet -------------------------------------
+    GH -.->|webhook| ALBJ
+    USR --> ALBA
+    ALBJ --> SVCJ --> JC
+    ALBG --> OBS
+    ALBA --> FE
+
+    %% --- Jenkins platform, created from code ---------------------------
+    JC --- PVC
+    CFG -.->|configures at startup| JC
+    JC -.->|seeds| JOBS
+    JC ==>|creates, deletes| ACI
+    JC ==>|creates, deletes| ACD
+
+    %% --- registry ------------------------------------------------------
+    ACI ==>|"push images (IRSA)"| ECR
+    ACD -->|"verify tag + digest (read-only)"| ECR
+
+    %% --- the Kubernetes API is the ONLY deploy path, and it is guarded --
+    ACD ==>|"helm upgrade<br/>SA token, no kubeconfig"| K8S
+    K8S ==>|"Role: jenkins-deployer<br/>devops-app ONLY"| FE
+    ACI -.->|"no deploy Role — DENIED"| K8S
+
+    %% --- application runtime -------------------------------------------
+    OBS -.->|"scrape :9090 metrics"| BE
+    OBS -.->|"scrape /prometheus"| JC
+    ACD -.->|"monitoring gate: is this release healthy?"| OBS
+
+    FE -->|proxy /api/| BE
+    BE -->|notify| WK
+    BE --> SEC
+    WK --> SEC
+    BE --> RDS
+    WK --> MSG
+    ACI --> S3
+
+    classDef exposed fill:#ffe5e5,stroke:#c0392b,stroke-width:2px
+    classDef jenkins fill:#e3f0ff,stroke:#2563a8,stroke-width:2px
+    classDef app fill:#e6f7ee,stroke:#1d7a4c,stroke-width:2px
+    classDef store fill:#f3ecff,stroke:#6b3fa0,stroke-width:2px
+    classDef secret fill:#fff6d6,stroke:#b8860b,stroke-width:3px
+    classDef ext fill:#f2f2f2,stroke:#666,stroke-width:1px
+    classDef config fill:#fdf0e6,stroke:#c2703d,stroke-width:2px
+    classDef control fill:#e8eef5,stroke:#37474f,stroke-width:2px
+    classDef monitoring fill:#f3ecff,stroke:#6b3fa0,stroke-width:2px
+
+    class ALBJ,ALBA,ALBG exposed
+    class OBS monitoring
+    class JC,PVC,ACI,ACD,SVCJ jenkins
+    class CFG,JOBS config
+    class K8S control
+    class FE,BE,WK app
+    class ECR,S3,RDS,MSG store
+    class SEC secret
+    class DEV,GH,USR ext

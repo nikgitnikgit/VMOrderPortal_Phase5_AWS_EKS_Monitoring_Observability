@@ -1,0 +1,108 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  labels:
+    app: worker
+spec:
+  replicas: {{ .Values.replicas }}
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+      annotations:
+        # LIVE-DEPLOY LESSON: Kubernetes does NOT restart pods when a
+        # ConfigMap changes — pods keep the env they started with. This
+        # checksum makes any config change alter the pod template, which
+        # forces a rolling restart so new config actually takes effect.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ .Values.serviceAccount.name }}
+      # Spread replicas across different nodes (our availability decision).
+      # ScheduleAnyway = soft rule: better one node with two replicas than
+      # a pod stuck Pending during a node failure.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: worker
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: "{{ .Values.image.registry }}/{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+{{- if .Values.monitoring.enabled }}
+            # Named 'metrics' so the Service can target it by name. Served by
+            # the gunicorn MASTER process, not a worker - see
+            # app/common/metrics.py for why that is the only arrangement that
+            # reports consistent counters from a forking server.
+            - name: metrics
+              containerPort: {{ .Values.metricsPort }}
+{{- end }}
+          # All config via env — the app code is unchanged from phase 2
+          env:
+            # Build identity for app_build_info. Empty values are rendered as
+            # "unknown" by the metrics module rather than as an empty label,
+            # because an empty label joins to nothing and a panel filtering on
+            # it shows no data instead of showing that the value is missing.
+            - name: APP_VERSION
+              value: {{ .Values.build.version | default .Values.image.tag | quote }}
+            - name: GIT_SHA
+              value: {{ .Values.build.gitSha | default .Values.image.tag | quote }}
+            - name: RELEASE
+              value: {{ .Values.build.release | default .Release.Name | quote }}
+            - name: METRICS_PORT
+              value: {{ .Values.metricsPort | quote }}
+            # The multiprocess directory lives on the /tmp emptyDir that already
+            # exists for the read-only root filesystem. It is wiped at pod start
+            # by gunicorn's on_starting hook: an emptyDir survives a container
+            # restart, so a crashed worker's samples would otherwise be merged
+            # into every later scrape forever.
+            - name: PROMETHEUS_MULTIPROC_DIR
+              value: /tmp/prom
+          envFrom:
+            - configMapRef:
+                name: worker-config
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          resources:
+            requests:
+              cpu: {{ .Values.resources.requests.cpu }}
+              memory: {{ .Values.resources.requests.memory }}
+            limits:
+              cpu: {{ .Values.resources.limits.cpu }}
+              memory: {{ .Values.resources.limits.memory }}
+          # Your existing /health endpoint from phase 2 becomes the probe
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

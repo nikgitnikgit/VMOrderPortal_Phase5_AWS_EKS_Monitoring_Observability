@@ -1,0 +1,95 @@
+# helm/frontend/values.yaml
+image:
+  registry: ""                  # (deploy.sh)
+  repository: vm-order-frontend
+  tag: "1.0.0"
+
+replicas: 2
+
+serviceAccount:
+  name: frontend-sa
+  roleArn: ""                   # stays EMPTY on purpose: nginx needs ZERO
+                                # AWS access — least privilege includes
+                                # granting nothing when nothing is needed
+
+service:
+  port: 8080                    # non-root nginx cannot bind below 1024
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 200m
+    memory: 128Mi
+
+hpa:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPU: 70
+
+ingress:
+  enabled: true
+  # AWS Load Balancer Controller reads these annotations and creates a real ALB
+  scheme: internet-facing
+  healthcheckPath: /healthz
+
+  # REVIEW FIX 4.4 — set this to enable HTTPS (443 + redirect from 80).
+  # Empty by default so a fresh clone deploys without a certificate.
+  # Get an ARN with:  ./scripts/create-cert.sh
+  # Then pass it at deploy time:
+  #   helm upgrade ... --set ingress.certificateArn=arn:aws:acm:...
+  # Jenkins already does exactly this; the app was the one still on plain HTTP.
+  certificateArn: ""
+  # ELBSecurityPolicy-2016-08 (the ALB default) still allows TLS 1.0 and 1.1.
+  sslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+existingSecret: ""              # frontend needs NO secrets at all
+
+networkPolicy:
+  enabled: true
+  vpcCidr: 10.23.0.0/16         # ALB traffic arrives from inside the VPC
+
+# --- Phase 5: observability --------------------------------------------------
+monitoring:
+  enabled: true
+  interval: 30s
+  scrapeTimeout: 10s
+  namespace: observability
+
+metricsPort: 9113          # the exporter sidecar, never nginx's 8080
+
+# nginx cannot speak Prometheus. stub_status (docker/frontend/nginx.conf, bound
+# to 127.0.0.1:8081) exposes counters in nginx's own text format and this
+# sidecar translates them.
+#
+# Why a sidecar rather than measuring only in the backend: the backend cannot
+# count a request that never reached it. When every backend pod is unhealthy
+# nginx returns 502 and backend-side metrics show a quiet, blameless service
+# while users see nothing but errors. The availability SLI has to be measured
+# where the user is.
+exporter:
+  image:
+    repository: nginx/nginx-prometheus-exporter
+    tag: "1.4.2"
+    # Empty by default, and deliberately so.
+    #
+    # Every other image here is digest-pinned, and this one should be too - a
+    # tag is a mutable pointer and the maintainer can move it. But a digest can
+    # only come from the registry, and an INVENTED or stale one does not
+    # degrade gracefully: it fails the pull with "manifest unknown". So this
+    # follows the rule scripts/pin-base-images.sh already states for the base
+    # images - resolve it on a machine that can reach the registry, then commit
+    # it. `./scripts/pin-base-images.sh` fills this field in.
+    #
+    # Empty means "pull by tag", which is honest and works; it is not silently
+    # pretending to be pinned.
+    digest: ""
+  resources:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 50m
+      memory: 32Mi

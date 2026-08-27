@@ -1,0 +1,112 @@
+# k8s/namespace.yaml
+#
+# REVIEW FIX 4.1 — the application namespace used to exist only as an
+# imperative `kubectl create namespace` line inside install-jenkins.sh.
+# The review flagged the declarative-manifests requirement as PARTIAL for
+# exactly this reason: the namespace's labels were a side effect of a script
+# rather than a reviewable object in Git.
+#
+# That mattered in practice, not just on paper. NetworkPolicies select peer
+# namespaces by label, so the `kubernetes.io/metadata.name` label was load
+# bearing — and it lived in a shell line that `kubectl get` could not explain
+# the origin of. It is now a file you can read, diff and apply.
+#
+# Applied by scripts/install-jenkins.sh before anything is deployed into it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: devops-app
+  labels:
+    # Kubernetes sets this automatically on create, but NetworkPolicies in
+    # helm/*/templates/networkpolicy.yaml select on it, so it is declared
+    # explicitly rather than relied upon as an implementation detail.
+    kubernetes.io/metadata.name: devops-app
+    app.kubernetes.io/part-of: vm-order-portal
+    # Pod Security Admission: the workloads run as non-root with no
+    # privilege escalation and a read-only root filesystem, so they already
+    # satisfy "restricted". Enforcing it here means a future manifest that
+    # quietly drops those settings is REJECTED at admission rather than
+    # discovered later by a reviewer.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: jenkins
+  labels:
+    kubernetes.io/metadata.name: jenkins
+    app.kubernetes.io/part-of: vm-order-portal
+    # Pod Security Admission is deliberately NOT enforced here.
+    #
+    # An earlier version of this file set "baseline" and it broke CI on the
+    # first real run: the rootless BuildKit container in Jenkinsfile-ci must
+    # set seccompProfile.type=Unconfined and an unconfined AppArmor profile,
+    # because buildkitd cannot create its nested mount namespace otherwise.
+    # Baseline forbids both, so every agent pod was rejected at admission with
+    # 403 and no build could start. PSA is namespace-wide with no per-pod
+    # exemption, so there is no setting that admits BuildKit and still
+    # constrains the rest.
+    #
+    # This is a real relaxation, so it is worth being explicit about what
+    # still constrains this namespace instead:
+    #   * RBAC — jenkins-agent-ci cannot deploy, jenkins-agent-cd cannot push
+    #     images, neither can read Secrets (jenkins/rbac.yaml)
+    #   * NetworkPolicy — default-deny with named egress (jenkins/networkpolicy.yaml)
+    #   * IRSA — AWS permissions scoped per ServiceAccount
+    #   * A dedicated, tainted node group, so agents never share nodes with
+    #     the application
+    #   * The agent pods still set runAsNonRoot, numeric runAsUser, and
+    #     allowPrivilegeEscalation: false; BuildKit runs rootless and is NOT
+    #     a privileged container
+    #
+    # The application namespace above keeps "restricted", which is where the
+    # untrusted-input workloads actually live.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest
+    # Audit and warn at baseline: violations are logged and surfaced to anyone
+    # running kubectl, without blocking the build system.
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/warn: baseline
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: observability
+  labels:
+    kubernetes.io/metadata.name: observability
+    app.kubernetes.io/part-of: vm-order-portal
+    # Pod Security Admission is deliberately NOT enforced here, and the reason
+    # is node-exporter.
+    #
+    # node-exporter is a DaemonSet that reads the host's /proc, /sys and root
+    # filesystem through hostPath mounts and runs in the host network and PID
+    # namespaces. That is not a shortcut -- it is the only way to report a
+    # node's CPU, memory, disk and network from inside a container. Both
+    # "restricted" and "baseline" forbid hostPath and host namespaces, so
+    # enforcing either means every node-exporter pod is rejected at admission
+    # with a 403 and the cluster silently has no node metrics at all.
+    #
+    # PSA is namespace-wide with no per-pod exemption, exactly as in the
+    # jenkins namespace, so there is no setting that admits node-exporter and
+    # still constrains the rest. This is a real relaxation, so what actually
+    # constrains this namespace instead:
+    #   * NetworkPolicy -- default-deny with named egress
+    #     (helm/observability/templates/networkpolicy.yaml)
+    #   * RBAC -- every component has its own ServiceAccount, none is bound to
+    #     cluster-admin, and Prometheus holds read-only cluster verbs
+    #   * IRSA -- only Alertmanager has an AWS identity, and it may publish to
+    #     one SNS topic and nothing else
+    #   * A dedicated, tainted node group, so the monitoring plane never shares
+    #     a node with the application or with a build
+    #   * Prometheus, Grafana, Alertmanager and kube-state-metrics all still run
+    #     with runAsNonRoot, a numeric UID, no privilege escalation and a
+    #     read-only root filesystem. Only node-exporter needs the exemption.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/enforce-version: latest
+    # Audit and warn at baseline: anything that drifts is logged and surfaced
+    # to anyone running kubectl, without blocking the DaemonSet.
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/warn: baseline

@@ -1,0 +1,73 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: backend
+  labels:
+    app: backend
+spec:
+  podSelector:
+    matchLabels:
+      app: backend
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    # ONLY frontend pods may call the backend, only on its port
+    - from:
+        - podSelector:
+            matchLabels:
+              app: frontend
+      ports:
+        - port: 5000
+{{- if .Values.monitoring.enabled }}
+    # Prometheus, and ONLY Prometheus, and only on the metrics port.
+    #
+    # A namespaceSelector, not an ipBlock: pod IPs are ephemeral and a CIDR
+    # here would admit anything that happened to land in that range. The
+    # observability namespace carries kubernetes.io/metadata.name as an
+    # explicit label in k8s/namespace.yaml precisely so this rule can select
+    # on it rather than relying on a label Kubernetes sets implicitly.
+    #
+    # Note what this does NOT do: it does not widen access to the application
+    # port. The rule above still admits only the frontend to {{ .Values.service.port }}.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.monitoring.namespace }}
+      ports:
+        - port: {{ .Values.metricsPort }}
+{{- end }}
+  egress:
+    # DNS (resolve Service names)
+    - to: []
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Worker service
+    - to:
+        - podSelector:
+            matchLabels:
+              app: worker
+      ports:
+        - port: 5001
+    # RDS PostgreSQL — REVIEW FIX 4.6.
+    # This used to allow 5432 to the WHOLE VPC CIDR (a /16, ~65k addresses),
+    # which includes the public subnets, the node subnets and every other pod.
+    # A compromised pod could therefore reach any Postgres listener anywhere in
+    # the VPC, not just RDS. Narrowed to the two database subnets (/24 each),
+    # which is where RDS actually lives — a ~128x reduction in reachable hosts.
+    # Falls back to vpcCidr if dbSubnetCidrs is unset, so an older deploy that
+    # does not pass the new value still works rather than losing DB access.
+    - to:
+{{- range .Values.networkPolicy.dbSubnetCidrs }}
+        - ipBlock:
+            cidr: {{ . }}
+{{- end }}
+      ports:
+        - port: 5432
+    # AWS APIs (S3) over HTTPS
+    - to: []
+      ports:
+        - port: 443
+{{- end }}
