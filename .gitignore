@@ -1,0 +1,30 @@
+# Secrets and state — never commit
+terraform/terraform.tfvars
+terraform/*.tfstate*
+terraform/.terraform/
+terraform/backend.tf
+*.env
+# Local junk
+**/__pycache__/
+**/venv/
+.DS_Store
+# Trivy scan reports left in the working tree by a local scan.
+#
+# Anchored with a leading slash. Unanchored, this pattern matched at ANY depth,
+# including evidence/trivy-*.txt -- which evidence/README.md explicitly requires
+# as a deliverable. collect-ci-evidence.sh fetched those files, `git add -A`
+# skipped them silently, and the checklist item looked satisfied while the
+# reports were never committed. The negation below is belt and braces.
+/trivy-*.txt
+!evidence/trivy-*.txt
+
+# Local credential files — never commit
+*.token
+.github_token
+# Python test artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+reports/
+terraform/terraform.tfvars.*
+!terraform/terraform.tfvars.example
