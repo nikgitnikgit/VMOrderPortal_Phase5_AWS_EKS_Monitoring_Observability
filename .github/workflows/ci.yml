@@ -131,14 +131,23 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
-      - run: pip install flake8 pytest flask boto3 requests psycopg2-binary
+      # prometheus-client is NOT optional here, and its absence was hidden.
+      # app/*/app.py import metrics, which imports prometheus_client, so
+      # `pytest app/` fails at collection without it. It never surfaced because
+      # the flake8 step above runs first and was failing, so pytest never ran.
+      # Exactly the gap that broke the Jenkins agent image; T18.36 now checks
+      # this list too, derived from what the application actually imports.
+      - run: pip install flake8 pytest flask boto3 requests psycopg2-binary prometheus-client
       - run: flake8 app/ tests/
       - run: python3 -m pytest app/ -v
 
-  # REVIEW FIX 1.4 — the repository's own 115-check suite now gates pull
-  # requests. It was previously runnable only by hand, so regressions it was
-  # written to catch could still be merged. Every check is offline: AWS calls
-  # go through tests/mocks/, so no credentials are needed.
+  # REVIEW FIX 1.4 — the repository's own suite gates pull requests. It was
+  # previously runnable only by hand, so regressions it was written to catch
+  # could still be merged. Every check is offline: AWS calls go through
+  # tests/mocks/, so no credentials are needed.
+  #
+  # The count is deliberately not written here. It used to say "115-check
+  # suite" and was still saying it at 215.
   repo-tests:
     name: Repository test suite (tests/run_all.sh)
     runs-on: ubuntu-latest
@@ -146,9 +155,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.12' }
+      # ONE definition of the test tooling, shared with your machine.
+      #
+      # This step used to install its own list, which is how it fell behind what
+      # phase 5 added: no promtool, no kubeconform, no flake8, none of the
+      # application's Python dependencies. The dashboard check failed outright
+      # here and several others skipped -- and the runner rendered those skips
+      # as green ticks until that was fixed too.
+      #
+      # Calling the repository's own script instead means a contributor running
+      # it locally gets exactly what CI has, pinned to the same versions.
+      # T18.43 asserts this step still calls it.
       - name: Install test tooling
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
-          pip install pyyaml python-hcl2 crossplane dockerfile kubernetes-validate requests
+        run: ./scripts/install-test-tooling.sh
       - name: Run the suite
         run: bash tests/run_all.sh

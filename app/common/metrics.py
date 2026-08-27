@@ -65,6 +65,7 @@ from prometheus_client import (          # noqa: E402  (see the note above)
     start_http_server,
 )
 
+
 def _env_port(name: str, default: int) -> int:
     """Parse a port from the environment without ever raising at import time.
 

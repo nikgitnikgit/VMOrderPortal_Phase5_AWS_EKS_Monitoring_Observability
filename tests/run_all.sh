@@ -19,12 +19,32 @@
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO" || exit 1
-PASS=0; FAIL=0; FAILED_TESTS=()
+PASS=0; FAIL=0; SKIP=0; FAILED_TESTS=(); SKIPPED_TESTS=()
 
 t() { # t <id> <description> <command...>
   local id="$1" desc="$2"; shift 2
   if "$@" > /tmp/qa_out.log 2>&1; then
-    echo "  ✅ $id  $desc"; PASS=$((PASS+1))
+    # THREE outcomes, not two.
+    #
+    # This function used to have only pass and fail, so a check that printed
+    # "SKIPPED (needs postgresql + nginx)" and exited 0 -- which several of them
+    # do, honestly and on purpose -- was displayed as a green tick and counted
+    # as a pass. On GitHub Actions, where flask and prometheus_client are not
+    # installed, "the instrumentation survives hostile input and a hostile
+    # environment" ticked green having verified precisely nothing.
+    #
+    # The individual checks were not lying: each one says SKIPPED in its output.
+    # The RUNNER was, by rendering that as ✅ and folding it into the pass
+    # count. A summary of "214 passed" that includes checks which did not run is
+    # the strongest form of this project's recurring bug -- a weaker result
+    # wearing a stronger one's badge -- and it was in the harness itself.
+    if grep -qE '^\s*SKIPPED' /tmp/qa_out.log; then
+      echo "  ⏭️  $id  $desc"
+      sed 's/^/       /' /tmp/qa_out.log | head -2
+      SKIP=$((SKIP+1)); SKIPPED_TESTS+=("$id $desc")
+    else
+      echo "  ✅ $id  $desc"; PASS=$((PASS+1))
+    fi
   else
     echo "  ❌ $id  $desc"; sed 's/^/       /' /tmp/qa_out.log | head -6
     FAIL=$((FAIL+1)); FAILED_TESTS+=("$id $desc")
@@ -1563,6 +1583,44 @@ t T18.34 "the instrumentation survives hostile input and a hostile environment" 
 t T18.38 "both Jenkinsfiles are structurally parseable" \
   python3 tests/check_jenkinsfile_structure.py
 
+# THE SUITE NEVER LINTED THE PYTHON. Only GitHub Actions did.
+#
+# So `bash tests/run_all.sh` reported 214 passed on a tree that flake8 rejects,
+# and the error had been sitting in app/common/metrics.py since the audit added
+# a function to it. Every gate in this repository is described as "the suite is
+# the gate"; it was not the gate for lint, and the gap was invisible because the
+# thing that would have shown it ran somewhere else.
+#
+# Skips rather than fails when flake8 is absent, and says so — the runner now
+# renders that as a skip rather than a green tick, so an unlinted run cannot be
+# mistaken for a clean one.
+# The tooling CI installs and the tooling you install must be ONE definition.
+# Two lists is how the workflow ended up without promtool, kubeconform, flake8
+# or the application's dependencies while the suite grew checks that need all
+# four — and how the resulting skips got rendered as passes.
+t T18.43 "CI installs the test tooling from the repository's own script" python3 -c "
+import sys, yaml
+wf = yaml.safe_load(open('.github/workflows/ci.yml'))
+steps = wf['jobs']['repo-tests']['steps']
+runs = ' '.join(s.get('run', '') for s in steps)
+if 'scripts/install-test-tooling.sh' not in runs:
+    print('the repo-tests job does not call scripts/install-test-tooling.sh.')
+    print('It is installing its own list of tools, which is how CI and a')
+    print('developer machine drift into verifying different things.')
+    sys.exit(1)
+if 'pip install' in runs or 'apt-get install' in runs:
+    print('the repo-tests job installs tooling inline as well as via the script;')
+    print('put it in scripts/install-test-tooling.sh so there is one definition.')
+    sys.exit(1)
+print('CI and a developer machine install the same tooling, from one script')"
+
+t T18.42 "the Python lints clean (setup.cfg rules)" bash -c '
+  if ! python3 -m flake8 --version >/dev/null 2>&1; then
+    echo "SKIPPED (flake8 not installed: pip install flake8)"
+    exit 0
+  fi
+  python3 -m flake8 app/ tests/'
+
 # A number written into prose is a number that goes stale, quietly, and then
 # gets quoted at someone. The README said 51 unit tests when there were 52.
 # Small on its own; the same drift left a runbook naming an agent image tag that
@@ -1636,8 +1694,19 @@ print('every metric named in a diagram is one something produces')"
 t T18.39 "the unit-test count in README matches reality" bash -c '
   claimed=$(grep -oE "pytest.*\(([0-9]+) tests\)" README.md | grep -oE "[0-9]+ tests" | grep -oE "[0-9]+")
   [ -n "$claimed" ] || { echo "README no longer states a unit-test count where this check looks"; exit 1; }
+  # Skip, not fail, when pytest or the app dependencies are missing. This check
+  # is about a NUMBER IN A DOCUMENT being right, and a machine that cannot run
+  # the tests has no opinion on that. Failing there conflated "the README is
+  # wrong" with "this runner has no pytest" — and it was the second one, on
+  # GitHub Actions, in the job that deliberately installs no application deps.
+  if ! python3 -m pytest --version >/dev/null 2>&1; then
+    echo "SKIPPED (pytest not installed, so the real count is unknown)"; exit 0
+  fi
   actual=$(python3 -m pytest app/ -q 2>/dev/null | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+")
-  [ -n "$actual" ] || { echo "could not run pytest to get the real count"; exit 1; }
+  if [ -z "$actual" ]; then
+    echo "SKIPPED (pytest could not collect app/ — application dependencies absent)"
+    exit 0
+  fi
   [ "$claimed" = "$actual" ] || {
     echo "README says $claimed unit tests; pytest reports $actual"; exit 1; }
   echo "README and pytest agree: $actual unit tests"'
@@ -1683,6 +1752,7 @@ STDLIB = set(sys.stdlib_module_names)
 LOCAL = {'app', 'metrics', 'worker', 'conftest', 'test_app', 'test_worker'}
 
 missing = {}
+thirdparty = set()
 for f in pathlib.Path('app').rglob('*.py'):
     tree = ast.parse(f.read_text())
     for node in ast.walk(tree):
@@ -1692,7 +1762,10 @@ for f in pathlib.Path('app').rglob('*.py'):
         elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
             mods = [node.module.split('.')[0]]
         for m in mods:
-            if m in STDLIB or m in LOCAL or m in installed:
+            if m in STDLIB or m in LOCAL:
+                continue
+            thirdparty.add(m)
+            if m in installed:
                 continue
             missing.setdefault(m, []).append(str(f))
 
@@ -1706,7 +1779,31 @@ if missing:
     print('Add it to the pip3 install block in jenkins/agent-tools/Dockerfile')
     print('AND bump LABEL tools.version, or the new image is never pulled.')
     sys.exit(1)
-print(f'every third-party module the app imports is installed in the agent image')"
+
+# The SAME requirement, in the other place that runs pytest against app/.
+# The workflow's python-quality job installs its own list and was missing
+# prometheus-client; nobody noticed because the flake8 step ahead of it was
+# failing, so pytest never got to fail. One rule, both places.
+wf = pathlib.Path('.github/workflows/ci.yml').read_text()
+job = re.search(r'python-quality:.*?(?=\n  [a-z-]+:|\Z)', wf, re.S)
+if job:
+    body = job.group(0)
+    if 'pytest app/' in body:
+        wf_installed = set()
+        for line in body.splitlines():
+            m = re.search(r'pip install (.+)$', line)
+            if m:
+                wf_installed |= {p.lower().replace('-', '_') for p in m.group(1).split()}
+        for pkg, deps in TRANSITIVE.items():
+            if pkg in wf_installed:
+                wf_installed.update(deps)
+        gap = sorted({m for m in thirdparty if m not in wf_installed})
+        if gap:
+            print('the workflow python-quality job runs pytest app/ but does not install:')
+            for g in gap: print('  ' + g)
+            sys.exit(1)
+
+print('every third-party module the app imports is installed in the agent image and in CI')"
 
 # Also from that audit. A NetworkPolicy whose podSelector matches nothing is
 # not an error and is invisible in `kubectl get netpol` -- the operator's
@@ -2248,7 +2345,16 @@ t T18.30 "the observability scripts are executable and lint clean" bash -c '
 
 echo ""
 echo "=============================================="
-echo "  RESULT: $PASS passed, $FAIL failed"
-[ $FAIL -gt 0 ] && printf '  FAILED: %s\n' "${FAILED_TESTS[@]}"
+echo "  RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
+[ $FAIL -gt 0 ] && printf '  FAILED:  %s\n' "${FAILED_TESTS[@]}"
+# Skips are LISTED, always, not just counted. A skip is a check that did not
+# run, and the only thing worse than not running it is not knowing you did not
+# run it. Reading this list is part of reading the result.
+if [ $SKIP -gt 0 ]; then
+    echo ""
+    echo "  These checks did NOT run. They are not passes:"
+    printf '  SKIPPED: %s\n' "${SKIPPED_TESTS[@]}"
+    echo "  Install the missing tooling and re-run to actually verify them."
+fi
 echo "=============================================="
 exit $FAIL
