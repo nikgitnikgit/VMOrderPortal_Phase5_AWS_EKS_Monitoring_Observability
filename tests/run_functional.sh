@@ -23,6 +23,25 @@ if [ "$(id -u)" != "0" ]; then
 fi
 
 VENV=/tmp/qa_func_venv
+# The venv is cached across runs to keep this test quick, but "the directory
+# exists" is not the same as "the venv works" -- and the difference is not
+# theoretical. A venv hard-codes the interpreter it was built from, so upgrading
+# or switching python3 leaves a directory that looks fine and whose pip dies
+# with:
+#
+#     File "/tmp/qa_func_venv/bin/pip", line 5, in <module>
+#       from pip._internal.cli.main import main
+#     ModuleNotFoundError: No module named 'pip'
+#
+# which reads as a broken test rather than a stale cache. Found by moving this
+# sandbox from Python 3.11 to 3.12 to match the machine the suite actually runs
+# on. Verify the cache instead of trusting it, and rebuild when it is stale.
+VENV_REBUILT=0
+if [ -d "$VENV" ] && ! "$VENV/bin/python" -m pip --version >/dev/null 2>&1; then
+    echo "  (rebuilding $VENV — it was built by a different python3)"
+    rm -rf "$VENV"
+    VENV_REBUILT=1
+fi
 [ -d "$VENV" ] || python3 -m venv "$VENV"
 # TWO pip calls, not one, and that is load bearing.
 #
@@ -50,6 +69,16 @@ pg_ctlcluster 16 main start 2>/dev/null || service postgresql start 2>/dev/null 
 su postgres -c "psql -c \"CREATE USER vmadmin WITH PASSWORD 'testpass123';\"" 2>/dev/null || true
 su postgres -c "psql -c \"CREATE DATABASE vmorders OWNER vmadmin;\"" 2>/dev/null || true
 
+# A moto server left running from the OLD venv is still listening, so the
+# reachability check below is satisfied -- and then every AWS call fails with an
+# XML parse error from deep inside botocore, because the process is running from
+# an interpreter and site-packages that no longer exist. Reachable is not
+# healthy, which is the same lesson as the venv check above. If the venv was
+# rebuilt, the moto that belonged to it has to go with it.
+if [ "$VENV_REBUILT" = "1" ]; then
+    fuser -k 5566/tcp 2>/dev/null || true
+    sleep 1
+fi
 curl -s -m 2 http://127.0.0.1:5566/moto-api/data.json >/dev/null 2>&1 || \
   { setsid "$VENV/bin/moto_server" -p 5566 </dev/null >/tmp/qa_moto.log 2>&1 & sleep 3; }
 

@@ -140,7 +140,7 @@ RUN curl -fsSLo /usr/local/bin/hadolint \
 # instead -- which is already here and behaves the same everywhere.
 
 # --- promtool (from the Prometheus release tarball) ---
-ARG PROMTOOL_VERSION=3.1.0
+ARG PROMTOOL_VERSION=3.14.0
 RUN curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROMTOOL_VERSION}/prometheus-${PROMTOOL_VERSION}.linux-amd64.tar.gz" \
     | tar xz -C /tmp \
     && mv "/tmp/prometheus-${PROMTOOL_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool \
@@ -148,7 +148,7 @@ RUN curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PR
     && promtool --version
 
 # --- kubeconform ---
-ARG KUBECONFORM_VERSION=0.7.0
+ARG KUBECONFORM_VERSION=0.8.0
 RUN curl -fsSL "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
     | tar xz -C /tmp \
     && mv /tmp/kubeconform /usr/local/bin/kubeconform \

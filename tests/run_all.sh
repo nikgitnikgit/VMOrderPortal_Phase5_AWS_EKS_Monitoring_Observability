@@ -19,6 +19,74 @@
 set -u
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO" || exit 1
+
+# THE SUITE MUST NOT DIRTY THE TREE IT IS INSPECTING.
+#
+# T1.2 forbids __pycache__ anywhere outside tests/. Several checks execute the
+# application (pytest over app/, the instrumentation runtime check), and CPython
+# writes bytecode beside every module it imports -- so the suite created exactly
+# the junk its own second check forbids. On a clean checkout it passed; on every
+# run after that, T1.2 failed. A suite that only passes once is a suite people
+# learn to re-run with a `rm -rf` in front of it, which is how a real failure
+# gets cleaned away unread.
+#
+# It went unnoticed here for the worst possible reason: the habit of deleting
+# __pycache__ before each run. The bug was being tidied out of sight by the
+# person looking for it.
+#
+# run_functional.sh already sets this for the same reason; it belongs at the top
+# of the suite so no future check has to remember.
+#
+# BUT IT IS NOT SUFFICIENT ON ITS OWN, and relying on it alone was the second
+# mistake here. pytest rewrites assertions and writes its own
+# `*-pytest-<ver>.pyc` files, and whether it honours this variable varies by
+# interpreter and pytest version: suppressed on Python 3.11 here, not suppressed
+# on Python 3.12 in the field. A fix that works on the author's machine and not
+# on the reader's is not a fix, and "cannot reproduce it" is not a defence.
+#
+# So prevention is kept because it is free, and DETERMINISTIC CLEANUP is added
+# below because it does not care whether prevention worked. clean_pycache is
+# called by every check that executes application code, and T18.45 at the end
+# proves none of them forgot.
+export PYTHONDONTWRITEBYTECODE=1
+
+clean_pycache() {
+    # Only under app/, and only bytecode. Never a broad `rm -rf` in a test
+    # harness: this runs in the user's working tree.
+    find app -name "__pycache__" -type d -prune -exec rm -rf {} + 2>/dev/null || true
+    find app -name "*.pyc" -delete 2>/dev/null || true
+}
+export -f clean_pycache
+# ONE definition of build junk, used by the check at the START (T1.2, "the tree
+# you handed me is clean") and the one at the END (T18.45, "the suite did not
+# dirty it"). Those are different claims and both are worth making -- but they
+# have to look for the same things, or a file can pass one and fail the other.
+# .pytest_cache did exactly that: absent from T1.2's list, present in T18.45's.
+junk_list() {
+    find . \( -name "*.pyc" -o -name "__pycache__" -o -name ".pytest_cache" \
+              -o -name "*.egg-info" -o -name ".DS_Store" -o -name "*{*" -o -name "*}*" \) \
+         -not -path "./.git/*" -not -path "./tests/*" 2>/dev/null | sort
+}
+
+# Snapshot BEFORE anything runs, so the check at the end can tell "this was
+# already here" from "the suite made this".
+#
+# Without it T18.45 blamed the suite for a stale .pytest_cache that a previous
+# run had left and that `git clean -fd` does not remove (it is gitignored, and
+# only -x would take it -- which would also take terraform.tfvars, so -x is the
+# wrong answer). The message said "the suite created files"; the suite had not.
+# A check that reports the wrong cause sends someone looking in the wrong place,
+# which is its own kind of false result.
+JUNK_AT_START=$(junk_list)
+# EXPORTED, both of them. The checks below run inside `bash -c` subshells via
+# t(), which inherit only exported names. Without this, T1.2 would compare
+# against an empty string and pass unconditionally -- a check made vacuous by a
+# missing keyword, which is the precise failure this file is full of warnings
+# about. Verified by running the suite with junk present and watching T1.2 go
+# red rather than green.
+export JUNK_AT_START
+export -f junk_list
+
 PASS=0; FAIL=0; SKIP=0; FAILED_TESTS=(); SKIPPED_TESTS=()
 
 t() { # t <id> <description> <command...>
@@ -41,7 +109,14 @@ t() { # t <id> <description> <command...>
     if grep -qE '^\s*SKIPPED' /tmp/qa_out.log; then
       echo "  ⏭️  $id  $desc"
       sed 's/^/       /' /tmp/qa_out.log | head -2
-      SKIP=$((SKIP+1)); SKIPPED_TESTS+=("$id $desc")
+      # Keep the REASON, not just the name. The summary used to end with
+      # "Install the missing tooling and re-run", which is one of several
+      # reasons a check skips and was the wrong one for T7.6 -- that needs
+      # ROOT, and no amount of installing fixes it. Telling someone to do the
+      # wrong thing about a real gap is how the gap survives.
+      reason=$(grep -m1 -oE 'SKIPPED.*' /tmp/qa_out.log | sed 's/^SKIPPED *//; s/^(//; s/)$//')
+      SKIP=$((SKIP+1)); SKIPPED_TESTS+=("$id $desc
+             reason: ${reason:-no reason given}")
     else
       echo "  ✅ $id  $desc"; PASS=$((PASS+1))
     fi
@@ -55,8 +130,28 @@ echo "=== T1: Project structure & hygiene ==="
 t T1.1 "expected top-level layout present" bash -c '
   for d in docker app terraform helm scripts jenkins docs .github tests; do [ -d "$d" ] || exit 1; done
   for f in README.md .gitignore .dockerignore; do [ -f "$f" ] || exit 1; done'
-t T1.2 "no junk files/dirs (braces, tmp, pyc, .git)" bash -c '
-  [ -z "$(find . -name "*{*" -o -name "*}*" -o -name "*.pyc" -o -name "__pycache__" -o -name ".DS_Store" | grep -v tests/)" ]'
+t T1.2 "no junk files/dirs (braces, tmp, pyc, caches)" bash -c '
+  # Uses junk_list so this and T18.45 cannot disagree about what junk is.
+  # They did: .pytest_cache was invisible here and fatal there, so a stale one
+  # sailed through this check and was then blamed on the suite at the end.
+  if [ -n "$JUNK_AT_START" ]; then
+    echo "the working tree already contained build junk before the suite ran:"
+    echo "$JUNK_AT_START"
+    echo ""
+    # NO BACKTICKS. This message sits in a double-quoted string inside
+    # bash -c, where backticks are command substitution, not punctuation -- so
+    # an earlier draft of this very line EXECUTED "git clean -fd" every time the
+    # check failed. A test that silently deletes untracked files in the tree it
+    # is inspecting is the worst thing in this file, and it got there by quoting
+    # a command name for readability.
+    echo "These are gitignored, so git clean -fd does NOT remove them"
+    echo "(and -x would also take terraform.tfvars, so do not reach for it)."
+    echo "Remove them explicitly:"
+    echo "  rm -rf .pytest_cache"
+    echo "  find . -name __pycache__ -prune -exec rm -rf {} +"
+    exit 1
+  fi
+  echo "working tree is free of build junk"'
 t T1.3 "no unexpected empty directories" bash -c '
   [ -z "$(find . -type d -empty | grep -v ".git")" ]'
 t T1.4 "all shell scripts executable" bash -c '
@@ -1573,8 +1668,10 @@ t T18.4 "the observability chart renders" bash -c '
 # Added by the pre-handover audit. Everything else in T18 reads files; this one
 # imports the instrumentation and attacks it, because all four properties it
 # guards were broken while the code read correctly.
-t T18.34 "the instrumentation survives hostile input and a hostile environment" \
-  python3 tests/check_metrics_runtime.py
+t T18.34 "the instrumentation survives hostile input and a hostile environment" bash -c '
+  python3 tests/check_metrics_runtime.py; rc=$?
+  clean_pycache
+  exit $rc'
 
 # Added by the pre-handover audit. Every other Jenkinsfile test greps for a
 # stage NAME, which a syntactically broken file satisfies perfectly well -- so
@@ -1598,6 +1695,53 @@ t T18.38 "both Jenkinsfiles are structurally parseable" \
 # Two lists is how the workflow ended up without promtool, kubeconform, flake8
 # or the application's dependencies while the suite grew checks that need all
 # four — and how the resulting skips got rendered as passes.
+# The agent image and the local/CI installer must build the SAME tools.
+#
+# They did not: the Dockerfile built kubeconform 0.7.0 while
+# install-test-tooling.sh installed 0.6.7, so a manifest could be judged valid
+# by one schema validator and invalid by another depending on where the check
+# ran. Nothing noticed, because nothing compared them.
+#
+# This also matters for security, which is easy to forget for a validation
+# tool: promtool 3.1.0 and kubeconform 0.7.0 had aged into a vulnerable Go
+# crypto/tls and gRPC, and the Trivy CRITICAL gate in install-jenkins.sh stopped
+# a deploy over it. Two pins that drift means two ageing curves to remember.
+t T18.44 "the agent image and the tooling installer pin the same tool versions" python3 -c "
+import re, sys, pathlib
+
+docker = pathlib.Path('jenkins/agent-tools/Dockerfile').read_text()
+script = pathlib.Path('scripts/install-test-tooling.sh').read_text()
+
+def one(text, pattern, where):
+    # re.M: the installer's pins are line-anchored, and without it '^' only
+    # matches the start of the whole file. Caught by mutation-testing this
+    # check and finding it failed identically whether the versions matched or
+    # not -- a check that always fails is as useless as one that always passes.
+    m = re.search(pattern, text, re.M)
+    if not m:
+        print(f'could not find {where} -- the pin was renamed or removed'); sys.exit(1)
+    return m.group(1)
+
+pairs = [
+    ('promtool',
+     one(docker, r'ARG PROMTOOL_VERSION=([0-9.]+)',    'PROMTOOL_VERSION in the Dockerfile'),
+     one(script, r'^PROM_VERSION=([0-9.]+)',           'PROM_VERSION in install-test-tooling.sh')),
+    ('kubeconform',
+     one(docker, r'ARG KUBECONFORM_VERSION=([0-9.]+)', 'KUBECONFORM_VERSION in the Dockerfile'),
+     one(script, r'^KUBECONFORM_VERSION=([0-9.]+)',    'KUBECONFORM_VERSION in install-test-tooling.sh')),
+]
+
+bad = [(t, a, b) for t, a, b in pairs if a != b]
+if bad:
+    print('the agent image and scripts/install-test-tooling.sh pin different versions:')
+    for t, a, b in bad:
+        print(f'  {t}: Dockerfile {a}, installer {b}')
+    print('')
+    print('CI, a developer machine and the build agent would then validate the')
+    print('same files with different tools and could disagree about the result.')
+    sys.exit(1)
+print('agent image and installer agree: ' + ', '.join(f'{t} {a}' for t, a, _ in pairs))"
+
 t T18.43 "CI installs the test tooling from the repository's own script" python3 -c "
 import sys, yaml
 wf = yaml.safe_load(open('.github/workflows/ci.yml'))
@@ -1702,7 +1846,8 @@ t T18.39 "the unit-test count in README matches reality" bash -c '
   if ! python3 -m pytest --version >/dev/null 2>&1; then
     echo "SKIPPED (pytest not installed, so the real count is unknown)"; exit 0
   fi
-  actual=$(python3 -m pytest app/ -q 2>/dev/null | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+")
+  actual=$(python3 -m pytest app/ -q -p no:cacheprovider 2>/dev/null | grep -oE "[0-9]+ passed" | grep -oE "[0-9]+")
+  clean_pycache
   if [ -z "$actual" ]; then
     echo "SKIPPED (pytest could not collect app/ — application dependencies absent)"
     exit 0
@@ -2343,6 +2488,37 @@ t T18.30 "the observability scripts are executable and lint clean" bash -c '
              scripts/monitoring-gate.sh scripts/validate-observability.sh \
              scripts/port-forward-monitoring.sh'
 
+# ===========================================================================
+# THE LAST CHECK, AND IT HAS TO BE LAST.
+#
+# T1.2 asserts the tree is free of build junk. It runs FIRST, so it describes
+# the tree the suite INHERITED -- it can say nothing about the tree the suite
+# LEAVES. Those are different claims, and the gap between them hid a real bug:
+# checks that execute the application wrote __pycache__ under app/, so the suite
+# passed on a clean checkout and failed on every subsequent run. The check that
+# would have caught it existed; it was simply at the wrong end.
+#
+# Same assertion, different moment. A suite that cannot be run twice is one
+# people learn to precede with `rm -rf`, and a real failure eventually gets
+# swept away with the noise.
+t T18.45 "the suite left the working tree as clean as it found it" bash -c '
+  # Compares against the snapshot taken before any check ran, so this reports
+  # only what THE SUITE created. The previous version listed everything it found
+  # and said "the suite created files" -- which was wrong for a stale
+  # .pytest_cache left by an earlier run, and sent the reader looking for a bug
+  # in the wrong place. Blaming the wrong cause is its own kind of false result.
+  created=$(comm -13 <(printf "%s\n" "$JUNK_AT_START") <(junk_list))
+  if [ -n "$created" ]; then
+    echo "the suite CREATED these, so the next run starts red:"
+    echo "$created"
+    echo ""
+    echo "Whatever ran the application code needs PYTHONDONTWRITEBYTECODE=1"
+    echo "(exported at the top of this file), -p no:cacheprovider for pytest,"
+    echo "or a clean_pycache call after it."
+    exit 1
+  fi
+  echo "the suite created no bytecode, caches or egg-info of its own"'
+
 echo ""
 echo "=============================================="
 echo "  RESULT: $PASS passed, $FAIL failed, $SKIP skipped"
@@ -2354,7 +2530,11 @@ if [ $SKIP -gt 0 ]; then
     echo ""
     echo "  These checks did NOT run. They are not passes:"
     printf '  SKIPPED: %s\n' "${SKIPPED_TESTS[@]}"
-    echo "  Install the missing tooling and re-run to actually verify them."
+    echo ""
+    echo "  Each reason above says what it needs. Missing tooling:"
+    echo "    ./scripts/install-test-tooling.sh"
+    echo "  Needs root (starts postgresql, creates a test database):"
+    echo "    sudo bash tests/run_all.sh"
 fi
 echo "=============================================="
 exit $FAIL

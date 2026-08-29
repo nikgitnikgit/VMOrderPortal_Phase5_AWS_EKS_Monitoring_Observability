@@ -31,8 +31,21 @@ set -euo pipefail
 # Pinned, for the same reason every other version in this project is pinned: a
 # floating "latest" makes a green run unreproducible, and a tool that silently
 # changes behaviour between runs is worse than one that is simply old.
-PROM_VERSION=3.1.0
-KUBECONFORM_VERSION=0.6.7
+#
+# MUST MATCH jenkins/agent-tools/Dockerfile. They did not: this script pinned
+# kubeconform 0.6.7 while the image built 0.7.0, so CI, a developer machine and
+# the build agent could each validate manifests with a different schema
+# validator and disagree about whether the same file was valid. T18.44 now
+# fails if they drift.
+#
+# These are also a SECURITY surface, which is easy to forget for a validation
+# tool. promtool 3.1.0 and kubeconform 0.7.0 were about nineteen months old and
+# had aged into a vulnerable Go crypto/tls (CVE-2025-68121) and gRPC
+# (CVE-2026-33186). The Trivy CRITICAL gate in install-jenkins.sh caught it and
+# stopped the deploy before the image was pushed -- which is the gate working,
+# not a gate to argue with. Old validation tooling is still shipped tooling.
+PROM_VERSION=3.14.0
+KUBECONFORM_VERSION=0.8.0
 
 NO_SUDO=0
 [ "${1:-}" = "--no-sudo" ] && NO_SUDO=1
@@ -110,19 +123,38 @@ for entry in $PYPKGS; do
     fi
     # Not --quiet: if this fails, the reason is the useful part. Captured so a
     # success stays tidy and a failure prints everything.
-    if out=$(python3 -m pip install $PIP_FLAGS "$pkg" 2>&1); then
-        if python3 -c "import ${mod}" >/dev/null 2>&1; then
-            note "installed: ${pkg}"
-        else
-            # pip succeeded and the import still fails: almost always a second
-            # python on the PATH, so say which one this script used.
-            note "PROBLEM: pip installed ${pkg} but 'import ${mod}' still fails"
-            note "         this python3 is $(command -v python3)"
-            PY_FAILED="$PY_FAILED $pkg"
+    if ! out=$(python3 -m pip install $PIP_FLAGS "$pkg" 2>&1); then
+        # ONE retry, for one specific and very common Debian/Ubuntu failure.
+        #
+        # Some pure-Python modules ship as .deb packages with no RECORD file,
+        # so pip refuses to replace them:
+        #
+        #   ERROR: Cannot uninstall blinker 1.7.0, RECORD file not found.
+        #          Hint: The package was installed by debian.
+        #
+        # On Ubuntu 24.04 that single message blocks flask entirely, because
+        # blinker is one of its dependencies. --ignore-installed leaves the
+        # apt-owned copy alone and installs alongside it, which is what is
+        # wanted: the suite needs the module importable, not the packaging
+        # tidy. Narrow on purpose -- only retried for THIS error, so a genuine
+        # failure (no such package, no network) is still reported as one.
+        #
+        # Found by matching the reader's interpreter rather than reasoning
+        # about it: invisible on Python 3.11, immediate on 3.12.
+        if printf '%s' "$out" | grep -q "RECORD file not found"; then
+            note "retrying ${pkg} with --ignore-installed (apt-owned dependency)"
+            out=$(python3 -m pip install $PIP_FLAGS --ignore-installed "$pkg" 2>&1) || true
         fi
+    fi
+    # The ONLY thing that decides the outcome is whether the module imports.
+    # Not pip's exit code, not "Successfully installed" in its output -- both of
+    # those have been wrong here before.
+    if python3 -c "import ${mod}" >/dev/null 2>&1; then
+        note "installed: ${pkg}"
     else
-        note "FAILED to install ${pkg}:"
+        note "FAILED: ${pkg} is still not importable after installing. pip said:"
         printf '%s\n' "$out" | tail -5 | sed 's/^/           /'
+        note "         this python3 is $(command -v python3)"
         PY_FAILED="$PY_FAILED $pkg"
     fi
 done
@@ -130,11 +162,20 @@ done
 # --- promtool --------------------------------------------------------------
 echo ""
 echo "[2/4] promtool  (T18.2 dashboards, and PromQL parsing in validate-observability.sh)"
-if have promtool; then
-    note "already present: $(promtool --version 2>&1 | head -1)"
+# VERSION, not mere presence. AUDIT FIX: this used to accept any promtool at
+# all, so a machine that installed 3.1.0 last week kept it forever -- including
+# after the pin moved for a CRITICAL CVE. "Already present" is not the question;
+# "is it the pinned version" is.
+if have promtool && promtool --version 2>&1 | grep -q "${PROM_VERSION}"; then
+    note "already at the pinned version: $(promtool --version 2>&1 | head -1)"
 elif [ "$SUDO" = "SKIP" ]; then
-    note "SKIPPED (needs root to write /usr/local/bin)"
+    if have promtool; then
+        note "SKIPPED (present but NOT ${PROM_VERSION}; needs root to replace)"
+    else
+        note "SKIPPED (needs root to write /usr/local/bin)"
+    fi
 else
+    if have promtool; then note "replacing $(promtool --version 2>&1 | head -1)"; fi
     # --strip-components, so the binary lands in bin/ rather than in a
     # versioned directory that the next release renames.
     curl -fsSL "https://github.com/prometheus/prometheus/releases/download/v${PROM_VERSION}/prometheus-${PROM_VERSION}.linux-amd64.tar.gz" \
@@ -146,11 +187,16 @@ fi
 # --- kubeconform -----------------------------------------------------------
 echo ""
 echo "[3/4] kubeconform  (Kubernetes schema validation in validate-observability.sh)"
-if have kubeconform; then
-    note "already present: $(kubeconform -v 2>&1 | head -1)"
+if have kubeconform && kubeconform -v 2>&1 | grep -q "${KUBECONFORM_VERSION}"; then
+    note "already at the pinned version: $(kubeconform -v 2>&1 | head -1)"
 elif [ "$SUDO" = "SKIP" ]; then
-    note "SKIPPED (needs root to write /usr/local/bin)"
+    if have kubeconform; then
+        note "SKIPPED (present but NOT ${KUBECONFORM_VERSION}; needs root)"
+    else
+        note "SKIPPED (needs root to write /usr/local/bin)"
+    fi
 else
+    if have kubeconform; then note "replacing $(kubeconform -v 2>&1 | head -1)"; fi
     curl -fsSL "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" \
         | $SUDO tar -xz -C /usr/local/bin kubeconform
     note "installed $(kubeconform -v 2>&1 | head -1)"
@@ -189,9 +235,22 @@ fi
 echo ""
 echo "=================================================="
 STILL=""
-for tool in helm promtool kubeconform shellcheck psql nginx; do
+for tool in helm shellcheck psql nginx; do
     have "$tool" || STILL="$STILL $tool"
 done
+# promtool and kubeconform are checked by VERSION here too, not just presence:
+# a stale one is not a missing one, but it is not the pinned one either, and
+# reporting "present" for a binary the CRITICAL gate will reject is the same
+# false comfort this script was rewritten to stop giving.
+WRONGVER=""
+if ! have promtool; then STILL="$STILL promtool"
+elif ! promtool --version 2>&1 | grep -q "${PROM_VERSION}"; then
+    WRONGVER="$WRONGVER promtool(want ${PROM_VERSION}, have $(promtool --version 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1))"
+fi
+if ! have kubeconform; then STILL="$STILL kubeconform"
+elif ! kubeconform -v 2>&1 | grep -q "${KUBECONFORM_VERSION}"; then
+    WRONGVER="$WRONGVER kubeconform(want ${KUBECONFORM_VERSION}, have $(kubeconform -v 2>&1 | head -1))"
+fi
 
 PY_STILL=""
 for entry in $PYPKGS; do
@@ -199,8 +258,9 @@ for entry in $PYPKGS; do
     python3 -c "import ${mod}" >/dev/null 2>&1 || PY_STILL="$PY_STILL $pkg"
 done
 
-if [ -n "$STILL" ] || [ -n "$PY_STILL" ]; then
+if [ -n "$STILL" ] || [ -n "$PY_STILL" ] || [ -n "$WRONGVER" ]; then
     [ -n "$STILL" ]    && echo "  MISSING BINARIES:$STILL"
+    [ -n "$WRONGVER" ] && echo "  WRONG VERSION:$WRONGVER"
     [ -n "$PY_STILL" ] && echo "  MISSING PYTHON PACKAGES:$PY_STILL"
     echo ""
     case "$STILL" in
