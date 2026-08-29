@@ -3,7 +3,7 @@
 **Severity:** critical · **Fires when:** a node is not Ready, or under memory
 or disk pressure, for 5 minutes
 
-This cluster has four nodes and three of them are single-purpose. Losing one is
+This cluster has five nodes (3 app, 1 jenkins, 1 monitoring) and two of them are single-purpose. Losing one is
 not something to ride out.
 
 | Node group | Loses |

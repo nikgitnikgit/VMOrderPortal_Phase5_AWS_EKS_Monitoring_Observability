@@ -90,8 +90,71 @@ if [ "$WEBHOOK_STATUS" != "ok" ]; then
     echo ""
 fi
 
-echo "=================================================="
-echo "Infrastructure and Jenkins are ready."
-echo "Open Jenkins, run application-ci, and it will hand off to application-cd."
-echo "Grafana is already serving; its URL and password were printed in step 2."
-echo "=================================================="
+# ---------------------------------------------------------------- handover
+#
+# EVERYTHING NEEDED TO LOG IN, IN ONE PLACE, WITH NO FOLLOW-UP COMMANDS.
+#
+# This used to end with "Grafana's URL and password were printed in step 2",
+# which was wrong twice: step 2 runs before the load balancer controller
+# exists, so the URL it printed was the literal string "<pending>"; and a
+# credential five hundred lines up a scrollback is a credential you go hunting
+# for. Both are read live from the cluster here, at the one moment when
+# everything that produces them has finished.
+if [ "${SKIP_VERIFY:-0}" != "1" ]; then
+    echo ""
+    echo "  collecting URLs and credentials..."
+
+    # Grafana's ALB is created by the controller that install-jenkins.sh
+    # installed a few minutes ago, so unlike in step 2 there is now something
+    # to wait for. Bounded, and its absence is reported rather than printed as
+    # a URL.
+    GRAFANA_HOST=""
+    for _ in $(seq 1 30); do
+        GRAFANA_HOST=$(kubectl get ingress -n observability -l app.kubernetes.io/name=grafana \
+            -o jsonpath="{.items[0].status.loadBalancer.ingress[0].hostname}" 2>/dev/null || true)
+        [ -n "$GRAFANA_HOST" ] && break
+        sleep 10
+    done
+    JENKINS_HOST=$(kubectl get ingress jenkins -n jenkins \
+        -o jsonpath="{.status.loadBalancer.ingress[0].hostname}" 2>/dev/null || true)
+
+    JENKINS_PASS=$(kubectl get secret jenkins -n jenkins \
+        -o jsonpath="{.data.jenkins-admin-password}" 2>/dev/null | base64 -d || true)
+    GRAFANA_PASS=$(kubectl get secret grafana-admin -n observability \
+        -o jsonpath="{.data.admin-password}" 2>/dev/null | base64 -d || true)
+
+    echo ""
+    echo "=================================================="
+    echo "  READY"
+    echo "=================================================="
+    echo ""
+    if [ -n "$JENKINS_HOST" ]; then
+        echo "  Jenkins   https://${JENKINS_HOST}"
+    else
+        echo "  Jenkins   ALB not ready yet — kubectl get ingress jenkins -n jenkins"
+    fi
+    echo "            admin / ${JENKINS_PASS:-<could not read secret jenkins/jenkins>}"
+    echo ""
+    if [ -n "$GRAFANA_HOST" ]; then
+        echo "  Grafana   https://${GRAFANA_HOST}"
+    else
+        echo "  Grafana   ALB not ready after 5 minutes —"
+        echo "            kubectl get ingress -n observability -l app.kubernetes.io/name=grafana"
+    fi
+    echo "            admin / ${GRAFANA_PASS:-<could not read secret grafana-admin>}"
+    echo ""
+    echo "  Both are restricted to your IP, and both certificates are"
+    echo "  self-signed, so the browser warns once."
+    echo ""
+    echo "  Prometheus and Alertmanager have NO Ingress, deliberately:"
+    echo "    ./scripts/port-forward-monitoring.sh"
+    echo ""
+    echo "  The APPLICATION is not deployed yet — deploy.sh does not deploy it."
+    echo "  Run application-ci in Jenkins; it hands off to application-cd, which"
+    echo "  prints the application URL when the release passes its checks."
+    echo "=================================================="
+else
+    echo "=================================================="
+    echo "Infrastructure and Jenkins are ready (verification skipped)."
+    echo "=================================================="
+fi

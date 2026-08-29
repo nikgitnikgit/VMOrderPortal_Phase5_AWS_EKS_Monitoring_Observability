@@ -37,7 +37,7 @@ controller:
                   - key: ECR_REGISTRY
                     value: "<account-id>.dkr.ecr.<region>.amazonaws.com"
                   - key: AGENT_TOOLS_IMAGE
-                    value: "<account-id>.dkr.ecr.<region>.amazonaws.com/vm-order-jenkins-agent:tools-1.4"
+                    value: "<account-id>.dkr.ecr.<region>.amazonaws.com/vm-order-jenkins-agent:tools-1.5"
                   - key: JENKINS_NODE_GROUP
                     value: "<cluster-name>-jenkins-nodes"
                   - key: BACKEND_ROLE_ARN

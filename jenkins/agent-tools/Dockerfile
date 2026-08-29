@@ -21,7 +21,7 @@ FROM debian:12.9-slim@sha256:12c396bd585df7ec21d5679bb6a83d4878bc4415ce926c9e5ea
 # it silently keeps running the old image, and every change here becomes a
 # no-op that still reads as applied. T17.11 asserts this label matches the tag
 # the scripts publish, so the two can no longer drift apart.
-LABEL tools.version="1.4"
+LABEL tools.version="1.5"
 
 # REVIEW FIX 1.3 (hadolint DL4006) — several RUN steps below pipe `curl` into
 # `tar`. The default /bin/sh reports only the exit status of the LAST command
@@ -61,7 +61,8 @@ RUN pip3 install --no-cache-dir --break-system-packages \
         psycopg2-binary==2.9.9 \
         boto3==1.37.0 \
         requests==2.32.3 \
-        prometheus-client==0.21.1
+        prometheus-client==0.21.1 \
+        pyyaml==6.0.2
 
 # --- AWS CLI v2 ---
 RUN curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscli.zip \

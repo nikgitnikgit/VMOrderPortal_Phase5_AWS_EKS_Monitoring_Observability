@@ -1802,6 +1802,32 @@ t T18.41 "every runbook_url is built from the single configured base" bash -c '
       done
   echo "all runbook_urls derive from ${base}"'
 
+# The shipped NodeNotReadyOrPressure alert description told an on-call person
+# the cluster had "four nodes and three of them single-purpose". It has five,
+# two single-purpose -- Phase 4's numbers, left behind when Phase 5 added the
+# monitoring node group, and repeated in the runbook and the sizing table.
+# Test IDs must be unique. Not because a duplicate breaks anything -- both
+# copies run -- but because the summary names failures by ID, and two checks
+# answering to one name is a report you cannot act on.
+#
+# The regex matters more than it looks: an earlier attempt at this used
+# ^t T[0-9.]+ and reported T13.1 as duplicated, because that pattern stops
+# before the "b" in T13.1b. It found a bug that did not exist. Suffixed IDs are
+# legitimate and the pattern has to admit them.
+t T18.47 "every test ID is unique" bash -c '
+  dupes=$(grep -oE "^t T[0-9]+\.[0-9]+[a-z]*" tests/run_all.sh | sort | uniq -d)
+  if [ -n "$dupes" ]; then
+    echo "these test IDs are defined more than once:"
+    echo "$dupes"
+    echo "The summary reports failures by ID, so a duplicate names two checks."
+    exit 1
+  fi
+  n=$(grep -cE "^t T[0-9]+\.[0-9]+[a-z]*" tests/run_all.sh)
+  echo "$n test IDs, all distinct"'
+
+t T18.46 "documented node counts match what Terraform creates" \
+  python3 tests/check_node_count.py
+
 t T18.40 "no diagram names a metric that nothing produces" python3 -c "
 import glob, re, subprocess, sys
 
@@ -1856,110 +1882,19 @@ t T18.39 "the unit-test count in README matches reality" bash -c '
     echo "README says $claimed unit tests; pytest reports $actual"; exit 1; }
   echo "README and pytest agree: $actual unit tests"'
 
-# Added by the pre-handover audit, which found that Phase 5 broke every CI build
-# and nothing noticed. `python3 -m pytest app/` runs against the packages baked
-# into the agent image -- CI never installs requirements.txt -- so adding
-# `import metrics` to app.py and worker.py without adding prometheus-client to
-# jenkins/agent-tools/Dockerfile made collection fail with ModuleNotFoundError
-# before a single test ran. Nothing was built, scanned or promoted.
+# REPLACED a narrower check that looked only at what app/ imports. It fixed the
+# prometheus_client instance and missed the class: CI also runs
+# validate-observability.sh, which imports yaml in inline Python and in
+# check_metrics_contract.py, and pyyaml was not in the image either. The offline
+# suite was green while the pipeline died with ModuleNotFoundError, because the
+# check modelling the agent image was reading the wrong files.
 #
-# Proved by building a venv with exactly the image's package list and running
-# the suite: 2 collection errors. The offline suite could not see it because it
-# runs on a machine where requirements.txt is already installed.
-t T18.36 "the CI agent image can import everything the app imports" python3 -c "
-import ast, re, sys, pathlib
+# This walks what Jenkinsfile-ci actually executes: the scripts it invokes, the
+# inline Python in those scripts, the tests/*.py they call, and the modules it
+# runs directly.
+t T18.36 "the agent image satisfies every module CI imports" \
+  python3 tests/check_agent_image_deps.py
 
-# What the image installs.
-docker = pathlib.Path('jenkins/agent-tools/Dockerfile').read_text()
-block = re.search(r'RUN pip3 install[^\n]*\n((?:\s+\S+==\S+\s*\\\\?\n)+)', docker)
-if not block:
-    print('could not find the pip install block in jenkins/agent-tools/Dockerfile'); sys.exit(1)
-installed = {m.group(1).lower().replace('-', '_')
-             for m in re.finditer(r'([A-Za-z0-9_.-]+)==', block.group(1))}
-# Import name != distribution name, and pip pulls transitive dependencies that
-# are importable without being named in the Dockerfile. This closure was taken
-# from a real venv built with exactly the image's pip line
-# (\`pip list --format=freeze\`), not guessed -- botocore is the one that matters,
-# because app/worker/worker.py imports it directly while only boto3 is declared.
-TRANSITIVE = {
-    'psycopg2_binary': ['psycopg2'],
-    'boto3':           ['botocore', 's3transfer', 'jmespath', 'dateutil', 'six', 'urllib3'],
-    'flask':           ['werkzeug', 'jinja2', 'click', 'itsdangerous', 'blinker', 'markupsafe'],
-    'requests':        ['certifi', 'charset_normalizer', 'idna', 'urllib3'],
-    'pytest':          ['pluggy', 'iniconfig', 'packaging'],
-    'pytest_cov':      ['coverage'],
-}
-for pkg, deps in TRANSITIVE.items():
-    if pkg in installed:
-        installed.update(deps)
-
-STDLIB = set(sys.stdlib_module_names)
-LOCAL = {'app', 'metrics', 'worker', 'conftest', 'test_app', 'test_worker'}
-
-missing = {}
-thirdparty = set()
-for f in pathlib.Path('app').rglob('*.py'):
-    tree = ast.parse(f.read_text())
-    for node in ast.walk(tree):
-        mods = []
-        if isinstance(node, ast.Import):
-            mods = [a.name.split('.')[0] for a in node.names]
-        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-            mods = [node.module.split('.')[0]]
-        for m in mods:
-            if m in STDLIB or m in LOCAL:
-                continue
-            thirdparty.add(m)
-            if m in installed:
-                continue
-            missing.setdefault(m, []).append(str(f))
-
-if missing:
-    print('the CI agent image cannot import what the application imports.')
-    print('Jenkinsfile-ci runs pytest against the packages baked into the image;')
-    print('it never installs requirements.txt, so collection fails before any test runs:')
-    for m, files in sorted(missing.items()):
-        print(f'  {m}  (imported by {files[0]})')
-    print('')
-    print('Add it to the pip3 install block in jenkins/agent-tools/Dockerfile')
-    print('AND bump LABEL tools.version, or the new image is never pulled.')
-    sys.exit(1)
-
-# The SAME requirement, in the other place that runs pytest against app/.
-# The workflow's python-quality job installs its own list and was missing
-# prometheus-client; nobody noticed because the flake8 step ahead of it was
-# failing, so pytest never got to fail. One rule, both places.
-wf = pathlib.Path('.github/workflows/ci.yml').read_text()
-job = re.search(r'python-quality:.*?(?=\n  [a-z-]+:|\Z)', wf, re.S)
-if job:
-    body = job.group(0)
-    if 'pytest app/' in body:
-        wf_installed = set()
-        for line in body.splitlines():
-            m = re.search(r'pip install (.+)$', line)
-            if m:
-                wf_installed |= {p.lower().replace('-', '_') for p in m.group(1).split()}
-        for pkg, deps in TRANSITIVE.items():
-            if pkg in wf_installed:
-                wf_installed.update(deps)
-        gap = sorted({m for m in thirdparty if m not in wf_installed})
-        if gap:
-            print('the workflow python-quality job runs pytest app/ but does not install:')
-            for g in gap: print('  ' + g)
-            sys.exit(1)
-
-print('every third-party module the app imports is installed in the agent image and in CI')"
-
-# Also from that audit. A NetworkPolicy whose podSelector matches nothing is
-# not an error and is invisible in `kubectl get netpol` -- the operator's
-# selector was wrong, so it fell through to default-deny and could never create
-# the Prometheus StatefulSet at all.
-# Added by the pre-handover audit. CD held write access to prometheusrules in
-# devops-app, justified by a comment claiming the app charts ship a
-# PrometheusRule. They ship only a ServiceMonitor. Prometheus discovers rules
-# across namespaces, so that grant let the deploy pipeline author an alert rule
-# -- which the same comment block says it must never do. This derives the
-# allowed set from the charts instead of trusting the comment.
 t T18.37 "CD's monitoring.coreos.com grant matches what the app charts render" python3 -c "
 import subprocess, yaml, sys
 kinds = set()

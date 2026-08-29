@@ -34,7 +34,7 @@ SNS_TOPIC_ARN=$(terraform output -raw sns_topic_arn)
 SES_SENDER=$(terraform output -raw ses_sender)
 
 JENKINS_NODE_GROUP="${CLUSTER_NAME}-jenkins-nodes"
-TOOLS_IMAGE="${ECR_REGISTRY}/vm-order-jenkins-agent:tools-1.4"
+TOOLS_IMAGE="${ECR_REGISTRY}/vm-order-jenkins-agent:tools-1.5"
 JENKINS_CHART_VERSION=$(tr -d '[:space:]' < "$REPO_ROOT/jenkins/CHART_VERSION")
 
 echo "=================================================="
@@ -195,7 +195,7 @@ echo "  app    : ${APP_CERT_ARN}"
 echo ""
 echo "[6/8] Agent tools image..."
 if aws ecr describe-images --repository-name "vm-order-jenkins-agent" \
-     --image-ids imageTag="tools-1.4" --region "$AWS_REGION" >/dev/null 2>&1; then
+     --image-ids imageTag="tools-1.5" --region "$AWS_REGION" >/dev/null 2>&1; then
     echo "  already in ECR — skipping build"
     echo "  (bump the tag in this script after editing agent-tools/Dockerfile)"
 else

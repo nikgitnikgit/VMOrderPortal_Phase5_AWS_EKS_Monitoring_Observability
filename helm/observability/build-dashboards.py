@@ -44,6 +44,27 @@ def nid():
     return _id[0]
 
 
+# WHEN `or vector(0)` IS HONEST, AND WHEN IT IS A LIE
+#
+# It appends a zero when a query returns nothing, and whether that is truthful
+# depends entirely on what "nothing" means for that metric:
+#
+#   HONEST  -- kube_pod_status_phase{phase="Pending"}, restart counts, OOM
+#              counts, firing ALERTS. kube-state-metrics only emits a series
+#              when the object exists, so an empty result genuinely means
+#              "there are none of these". Zero is the fact.
+#
+#   A LIE   -- anything from the Jenkins plugin (jenkins_*). Those series exist
+#              continuously once Jenkins is scraped, so an empty result does not
+#              mean "no builds" -- it means JENKINS IS NOT BEING SCRAPED. A
+#              green 0 there says "nothing is wrong" about the one situation
+#              where you cannot tell.
+#
+# The same mistake shipped in the SLI recording rules: with no application
+# deployed the dashboard reported 100% availability and a 0% error ratio, in
+# green, on the row headed "is the product working?". Absence must render as
+# absence. "No data" makes someone look; a confident zero makes them look away.
+
 def target(expr, legend="", instant=False):
     return {
         "datasource": DS,
@@ -412,14 +433,14 @@ def jenkins_delivery():
                   desc="Non-empty for 15 continuous minutes is what JenkinsQueueStuck alerts on.",
                   thr=thresholds([("green", None), ("orange", 1), ("red", 5)])))
     p.append(stat("Busy executors",
-                  [target("jenkins_executor_in_use_value or vector(0)", "in use")],
+                  [target("jenkins_executor_in_use_value", "in use")],
                   x=6, y=y, w=6,
                   desc="The controller runs numExecutors=0 on purpose, so anything here is a dynamic agent pod doing real work."))
     p.append(stat("Builds (1h)",
-                  [target("sum(increase(jenkins_runs_total_total[1h])) or vector(0)", "builds")],
+                  [target("sum(increase(jenkins_runs_total_total[1h]))", "builds")],
                   x=12, y=y, w=6, desc="Total across both pipelines."))
     p.append(stat("Failures (1h)",
-                  [target("sum(increase(jenkins_runs_failure_total[1h])) or vector(0)", "failed")],
+                  [target("sum(increase(jenkins_runs_failure_total[1h]))", "failed")],
                   x=18, y=y, w=6,
                   desc="A CI failure is the system working — nothing was promoted. A CD failure means a rollback ran.",
                   thr=thresholds([("green", None), ("orange", 1), ("red", 3)])))
@@ -428,7 +449,7 @@ def jenkins_delivery():
     p.append(row("Queue and agents", y)); y += 1
     p.append(timeseries("Queue length and wait time",
                         [target("jenkins_queue_size_value", "queue length"),
-                         target("jenkins_queue_waiting_value or vector(0)", "waiting")],
+                         target("jenkins_queue_waiting_value", "waiting")],
                         x=0, y=y,
                         desc=("Length alone does not distinguish 'busy' from 'stuck'. A queue that is long and moving is fine; "
                               "one that is short and motionless is not.")))
@@ -444,7 +465,7 @@ def jenkins_delivery():
     p.append(timeseries("Build result rate",
                         [target("sum(rate(jenkins_runs_success_total[15m]) * 900)", "success"),
                          target("sum(rate(jenkins_runs_failure_total[15m]) * 900)", "failure"),
-                         target("sum(rate(jenkins_runs_unstable_total[15m]) * 900) or vector(0)", "unstable")],
+                         target("sum(rate(jenkins_runs_unstable_total[15m]) * 900)", "unstable")],
                         x=0, y=y, desc="Builds per 15 minutes by outcome."))
     p.append(timeseries("Build duration",
                         [target("jenkins_builds_last_build_duration_milliseconds", "{{jenkins_job}}")],
@@ -459,7 +480,7 @@ def jenkins_delivery():
                         unit="bytes", x=0, y=y, w=8,
                         desc="The controller has a 2Gi limit. Heap approaching max means a restart is coming, mid-build."))
     p.append(timeseries("Controller uptime",
-                        [target("jenkins_node_online_value or vector(0)", "online")],
+                        [target("jenkins_node_online_value", "online")],
                         x=8, y=y, w=8, desc="Drops to zero on a restart, which explains a queue that suddenly emptied."))
     p.append(stat("Time since last successful build",
                   [target("time() - max(jenkins_runs_success_total > 0) * 0 - max(process_start_time_seconds{namespace=\"" + JENKINS_NS + "\"})", "since")],

@@ -198,6 +198,34 @@ helm upgrade --install observability "$REPO_ROOT/helm/observability" \
     --wait --timeout 5m
 
 echo ""
+# AUDIT FIX -- do not wait six minutes for something that cannot happen.
+#
+# The AWS Load Balancer Controller is installed by install-jenkins.sh, which
+# deploy.sh runs AFTER this script. So on a first deploy there is no controller
+# in the cluster to act on Grafana's Ingress: the loop below counted to 36,
+# slept six minutes, and printed "Grafana: https://<pending>" -- a URL that
+# cannot work and a wait that could never succeed.
+#
+# The ordering itself is deliberate and stays: the Jenkins chart ships a
+# ServiceMonitor, and a chart referencing a CRD that does not exist yet fails
+# outright, so observability must go first (T18.21). The ALB controller is a
+# cluster add-on that happens to live in install-jenkins.sh for Phase 4
+# reasons. Rather than reorder a deploy that works, this asks whether the
+# controller is there and says plainly what happens next when it is not.
+if ! kubectl get deployment aws-load-balancer-controller -n kube-system >/dev/null 2>&1; then
+    echo ""
+    echo "  The AWS Load Balancer Controller is not installed yet, so Grafana's"
+    echo "  Ingress has nothing to act on it. This is expected on a first deploy:"
+    echo "  install-jenkins.sh installs the controller in the next step, and it"
+    echo "  will then create the ALB for the Ingress that already exists."
+    echo ""
+    echo "  Get the URL after install-jenkins.sh finishes:"
+    echo "    kubectl get ingress -n ${NAMESPACE} -l app.kubernetes.io/name=grafana"
+    GRAFANA_HOST=""
+    SKIP_ALB_WAIT=1
+fi
+
+if [ "${SKIP_ALB_WAIT:-0}" != "1" ]; then
 echo "  waiting for Grafana's ALB..."
 GRAFANA_HOST=""
 for i in $(seq 1 36); do
@@ -213,12 +241,22 @@ for i in $(seq 1 36); do
     echo "    ... not ready yet ($i/36)"
     sleep 10
 done
+fi
 
 echo ""
 echo "=================================================="
 echo "Observability installed."
 echo ""
-echo "  Grafana:  https://${GRAFANA_HOST:-<pending>}"
+# "<pending>" was printed as though it were a URL. Say what is actually true
+# and what to run, rather than offering something unusable.
+if [ -n "$GRAFANA_HOST" ]; then
+    echo "  Grafana:  https://${GRAFANA_HOST}"
+else
+    echo "  Grafana:  no ALB yet — the load balancer controller is installed by"
+    echo "            the next step. Once install-jenkins.sh finishes:"
+    echo "              kubectl get ingress -n ${NAMESPACE} -l app.kubernetes.io/name=grafana"
+    echo "            and open https://<the ADDRESS column>"
+fi
 echo "  User:     admin"
 if [ -n "$GRAFANA_PASS" ]; then
 echo "  Password: ${GRAFANA_PASS}"

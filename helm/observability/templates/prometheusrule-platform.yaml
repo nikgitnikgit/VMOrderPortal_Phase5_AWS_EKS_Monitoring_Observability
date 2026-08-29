@@ -25,30 +25,44 @@ spec:
     - name: sli.recording
       interval: 30s
       rules:
-        # Error ratio over 5 minutes. `or vector(0)` is deliberate: with no
-        # traffic at all the division produces an empty result, and an empty
-        # result in an alert expression means "do not fire", which is right.
-        # But the same empty result on a dashboard panel renders as "No data",
-        # which reads identically to "Prometheus is broken". vector(0) makes
-        # zero traffic show as a real zero.
+        # Error ratio over 5 minutes.
+        #
+        # NO `or vector(0)`, AND THAT IS THE FIX.
+        #
+        # This used to end `or vector(0)`, justified like this: "an empty result
+        # on a dashboard renders as 'No data', which reads identically to
+        # 'Prometheus is broken'. vector(0) makes zero traffic show as a real
+        # zero." That reasoning inverts the safety it was trying to buy.
+        #
+        # With no application deployed at all, the panel showed a green 0% and
+        # its neighbour showed a green 100% availability. "No data" makes
+        # someone look; a green zero makes them look away. Absence must never
+        # render as health -- and it did so on a first deploy, on the exact
+        # dashboard someone would open to ask "is the product working?".
+        #
+        # The alert is unaffected: an empty vector means "do not fire", which is
+        # still correct, because there is nothing to fire about. And p95 and
+        # requests/sec never had this and honestly said "No data" all along, so
+        # four panels about the same missing data now agree instead of two
+        # reassuring and two telling the truth.
         - record: sli:http_error_ratio:rate5m
           expr: |
-            (
-              sum(rate(http_requests_total{namespace="{{ .Values.app.namespace }}",status="5xx"}[5m]))
-              /
-              sum(rate(http_requests_total{namespace="{{ .Values.app.namespace }}"}[5m]))
-            ) or vector(0)
+            sum(rate(http_requests_total{namespace="{{ .Values.app.namespace }}",status="5xx"}[5m]))
+            /
+            sum(rate(http_requests_total{namespace="{{ .Values.app.namespace }}"}[5m]))
 
         # The 30-minute window the availability SLO is stated over.
+        #
+        # No `or vector(1)` -- see the error-ratio rule above. This one was the
+        # worse of the two: with nothing deployed it reported 100% AVAILABLE, in
+        # green, on the "is the product working?" row.
         - record: sli:http_availability:ratio30m
           expr: |
-            (
-              1 - (
-                sum(rate(http_requests_total{namespace="{{ .Values.app.namespace }}",status="5xx"}[30m]))
-                /
-                sum(rate(http_requests_total{namespace="{{ .Values.app.namespace }}"}[30m]))
-              )
-            ) or vector(1)
+            1 - (
+              sum(rate(http_requests_total{namespace="{{ .Values.app.namespace }}",status="5xx"}[30m]))
+              /
+              sum(rate(http_requests_total{namespace="{{ .Values.app.namespace }}"}[30m]))
+            )
 
         # p95 latency across the service.
         #
@@ -147,7 +161,7 @@ spec:
           annotations:
             summary: "Node {{`{{ $labels.node }}`}} is not Ready or is under resource pressure"
             description: >-
-              With four nodes and three of them single-purpose, losing one is
+              With five nodes and two of them single-purpose, losing one is
               not a degradation that can be ridden out: lose the monitoring
               node and this alert is the last thing you will hear about it.
             runbook_url: "{{ .Values.runbookBaseUrl }}/NodeNotReadyOrPressure.md"

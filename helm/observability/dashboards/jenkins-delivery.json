@@ -144,7 +144,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "jenkins_executor_in_use_value or vector(0)",
+          "expr": "jenkins_executor_in_use_value",
           "instant": false,
           "legendFormat": "in use",
           "range": true,
@@ -208,7 +208,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(jenkins_runs_total_total[1h])) or vector(0)",
+          "expr": "sum(increase(jenkins_runs_total_total[1h]))",
           "instant": false,
           "legendFormat": "builds",
           "range": true,
@@ -280,7 +280,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(increase(jenkins_runs_failure_total[1h])) or vector(0)",
+          "expr": "sum(increase(jenkins_runs_failure_total[1h]))",
           "instant": false,
           "legendFormat": "failed",
           "range": true,
@@ -376,7 +376,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "jenkins_queue_waiting_value or vector(0)",
+          "expr": "jenkins_queue_waiting_value",
           "instant": false,
           "legendFormat": "waiting",
           "range": true,
@@ -566,7 +566,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(jenkins_runs_unstable_total[15m]) * 900) or vector(0)",
+          "expr": "sum(rate(jenkins_runs_unstable_total[15m]) * 900)",
           "instant": false,
           "legendFormat": "unstable",
           "range": true,
@@ -806,7 +806,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "jenkins_node_online_value or vector(0)",
+          "expr": "jenkins_node_online_value",
           "instant": false,
           "legendFormat": "online",
           "range": true,

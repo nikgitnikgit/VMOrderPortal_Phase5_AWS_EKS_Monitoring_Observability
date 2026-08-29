@@ -147,15 +147,22 @@ Counting the series this cluster will actually produce:
 
 | Source | Active series |
 |---|---:|
-| node-exporter, 4 nodes | ~3,200 |
+| node-exporter, 5 nodes | ~4,000 |
 | kubelet + cAdvisor, ~45 containers | ~4,500 |
 | kube-state-metrics | ~6,000 |
 | our three services, 6 pods | ~1,700 |
 | Jenkins Prometheus plugin | ~2,000 |
 | the monitoring stack scraping itself | ~4,000 |
-| **total** | **~21,000** |
+| **total** | **~22,200** |
 
-21,000 series ÷ 30 s = 700 samples/sec. Over 15 days that is 907 million
+> Corrected after the first live deploy. The node-exporter row and the total
+> were Phase 4's figures (one node fewer, ~800 series fewer): Phase 5 adds the monitoring
+> node group, so the cluster is 3 app + 1 jenkins + 1 monitoring = **five**
+> nodes. The arithmetic below moves by about 4% and the conclusion does not
+> change, but a sizing table that quietly describes a different cluster is one
+> nobody can check.
+
+22,200 series ÷ 30 s = 740 samples/sec. Over 15 days that is 959 million
 samples, and Prometheus compresses to roughly 1.5–2 bytes each — **1.4–1.9 GB
 of chunk data**. Add index overhead from churn (every ephemeral CI agent pod
 and every rolling deploy mints pod-name series that live in the index for the
@@ -695,7 +702,7 @@ because these belong there next.
 |---|---|---|
 | 10.1 | **Helm does not upgrade CRDs** | kube-prometheus-stack CRDs are installed on first install and never touched again. Worse, they are too large for a client-side `kubectl apply` (the annotation exceeds 262144 bytes). Chart upgrades then fail with schema errors that look like values errors. Always `kubectl apply --server-side --force-conflicts` on the pinned CRD bundle as its own step |
 | 10.2 | **EKS control-plane scrape targets do not exist** | `kubeControllerManager`, `kubeScheduler`, `kubeEtcd` are AWS-managed and unreachable; `kubeProxy` binds its metrics to 127.0.0.1. Left enabled, four targets sit DOWN forever, `PrometheusTargetDown` becomes background noise, and "all targets up" stops being provable |
-| 10.3 | **node-exporter and custom taints** | The DaemonSet's default tolerations do not include `role=jenkins` or `role=monitoring`. It comes up healthy, reports no error, and simply has no data for two of the four nodes. Set `tolerations: [{operator: Exists}]` and assert pod count == node count |
+| 10.3 | **node-exporter and custom taints** | The DaemonSet's default tolerations do not include `role=jenkins` or `role=monitoring`. It comes up healthy, reports no error, and simply has no data for two of the five nodes. Set `tolerations: [{operator: Exists}]` and assert pod count == node count |
 | 10.4 | **`prometheus_client` under gunicorn** | Two workers means two registries. Without `PROMETHEUS_MULTIPROC_DIR` every scrape returns whichever worker answered, so counters appear to go backwards. And `Info` metrics are not supported in that mode at all — `app_build_info` must be a Gauge |
 | 10.5 | **A stale multiprocess directory** | The `/tmp` emptyDir survives a container restart within the same pod, so dead workers' `.db` files keep being merged. Wipe the directory in `on_starting` and `mark_process_dead` in `child_exit` |
 | 10.6 | **Jenkins plugin pinning** | `installLatestPlugins: false` means adding `prometheus` without regenerating the resolved set can leave a dependency unsatisfied and the controller will not start. Its four required deps happen to be pinned already — verify, do not assume |

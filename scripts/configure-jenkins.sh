@@ -56,6 +56,41 @@ if [ -z "$GITHUB_REPO_OWNER" ] || [ -z "$GITHUB_REPO_NAME" ] || [ "$GITHUB_REPO_
     echo "       Expected https://github.com/<owner>/<repo>[.git]" >&2
     exit 1
 fi
+
+# AUDIT FIX -- the check above validates the SHAPE, and a placeholder has a
+# perfectly good shape.
+#
+# terraform.tfvars.example ships
+#   github_repo_url = "https://github.com/YOUR_USER/<repo>.git"
+# and YOUR_USER/<repo> parses into owner and name without complaint. So the
+# validation written specifically to catch a bad repo URL passed the commonest
+# bad repo URL there is, Jenkins was configured to watch a repository that does
+# not exist, and the symptom appeared much later and somewhere else: an empty
+# multibranch folder, and in its scan log
+#
+#   FATAL: Invalid scan credentials when using anonymous access to connect to
+#          YOUR_USER/<repo> on https://api.github.com
+#
+# which reads as a credentials problem and is not one. verify-jenkins.sh did not
+# catch it either, because it only asserted the job existed.
+#
+# install-observability.sh already refuses to proceed when a PLACEHOLDER_ value
+# would reach the cluster. Same idea, applied to the placeholders this file can
+# actually receive.
+case "$GITHUB_REPO_OWNER/$GITHUB_REPO_NAME" in
+    YOUR_USER/*|*/YOUR_REPO|YOUR_ORG/*|your-user/*|\<*|*\>)
+        echo "ERROR: github_repo_url is still the example placeholder:" >&2
+        echo "         ${GITHUB_REPO_URL}" >&2
+        echo "       Jenkins would be configured to watch ${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}," >&2
+        echo "       which does not exist, and application-ci would sit empty with" >&2
+        echo "       'Invalid scan credentials' in its scan log." >&2
+        echo "" >&2
+        echo "       Set the real value in terraform/terraform.tfvars:" >&2
+        echo "         github_repo_url = \"https://github.com/<you>/<repo>.git\"" >&2
+        echo "       then: terraform apply && ./scripts/configure-jenkins.sh" >&2
+        exit 1
+        ;;
+esac
 S3_BUCKET=$(terraform output -raw s3_bucket_name)
 VPC_CIDR=$(terraform output -raw vpc_cidr)
 # REVIEW FIX 4.6 — `-raw` cannot render a list, so read it as JSON and join it
@@ -77,7 +112,7 @@ NOTIFICATION_EMAIL=$(terraform output -raw notification_email)
 SNS_TOPIC_ARN=$(terraform output -raw sns_topic_arn)
 
 [ -n "$NODE_GROUP" ]  || NODE_GROUP="${CLUSTER_NAME}-jenkins-nodes"
-[ -n "$TOOLS_IMAGE" ] || TOOLS_IMAGE="${ECR_REGISTRY}/vm-order-jenkins-agent:tools-1.4"
+[ -n "$TOOLS_IMAGE" ] || TOOLS_IMAGE="${ECR_REGISTRY}/vm-order-jenkins-agent:tools-1.5"
 if [ -z "$CERT_ARN" ]; then
     CERT_ARN=$(aws acm list-certificates --region "$AWS_REGION" \
         --query "CertificateSummaryList[?DomainName=='jenkins.vm-order.internal'].CertificateArn | [0]" \

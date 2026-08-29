@@ -738,6 +738,43 @@ output. To roll back manually:
             )
         }
         success {
+            // THE APPLICATION URL, IN THE BUILD LOG, WHEN THE RELEASE PASSED.
+            //
+            // Everything needed to look at what was just shipped is already in
+            // the cluster at this point; asking someone to run kubectl for it
+            // is asking them to do work the pipeline can do once.
+            //
+            // Guarded: failing to read the Ingress must not turn a green
+            // deployment red. The release passed its rollout, its smoke test
+            // and the monitoring gate before this block runs, and marking the
+            // build failed would send it to post{failure}, which rolls back.
+            catchError(buildResult: 'SUCCESS', stageResult: 'SUCCESS',
+                       message: 'could not read the application URL') {
+                container('tools') {
+                    sh """
+                        HOST=\$(kubectl get ingress -n "\$TARGET_NAMESPACE" \\
+                                 -o jsonpath='{.items[0].status.loadBalancer.ingress[0].hostname}' \\
+                                 2>/dev/null || true)
+                        echo "=================================================="
+                        echo "  RELEASE IS LIVE"
+                        echo "=================================================="
+                        echo "  image tag  : \$TAG"
+                        echo "  commit     : \${GIT_COMMIT_SHA:-not supplied}"
+                        echo "  namespace  : \$TARGET_NAMESPACE"
+                        if [ -n "\$HOST" ]; then
+                            echo "  application: https://\$HOST"
+                        else
+                            echo "  application: no Ingress hostname yet —"
+                            echo "               kubectl get ingress -n \$TARGET_NAMESPACE"
+                        fi
+                        echo ""
+                        echo "  It passed the rollout, the smoke test and the"
+                        echo "  monitoring gate: targets up, this commit serving,"
+                        echo "  5xx ratio and p95 latency both inside the SLO."
+                        echo "=================================================="
+                    """
+                }
+            }
             notify("Deployed ${env.TAG} to ${params.TARGET_NAMESPACE}", """Deployment succeeded.
 
   Image tag  : ${env.TAG}

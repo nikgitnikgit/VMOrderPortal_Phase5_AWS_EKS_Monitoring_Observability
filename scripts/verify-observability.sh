@@ -15,12 +15,33 @@ NAMESPACE="${NAMESPACE:-observability}"
 APP_NS="${APP_NS:-devops-app}"
 JENKINS_NS="${JENKINS_NS:-jenkins}"
 
-PASS=0; FAIL=0; SKIP=0
+PASS=0; FAIL=0; SKIP=0; PENDING=0
 FAILED=()
+NOT_DEPLOYED=()
 
 ok()   { echo "  [ OK ]  $1"; PASS=$((PASS+1)); }
 bad()  { echo "  [FAIL]  $1"; FAIL=$((FAIL+1)); FAILED+=("$1"); }
 skip() { echo "  [SKIP]  $1"; SKIP=$((SKIP+1)); }
+# A FOURTH outcome, and it earns its place.
+#
+# deploy.sh does not deploy the application -- the CD pipeline does. So on a
+# first deploy this script found no ServiceMonitors, no app NetworkPolicy, no
+# `up` series and no app_build_info, and reported EIGHT FAILURES. All eight were
+# true statements about a cluster in a perfectly normal state.
+#
+# That is worse than a wrong check. Eight red lines on every first run teaches
+# you to skim the failure list, and the whole value of this script is that
+# someone reads it. "Not deployed yet" is not a pass and not a defect; it is a
+# third thing, and it needs saying as a third thing.
+pending() { echo "  [....]  $1 — the application is not deployed yet"
+            PENDING=$((PENDING+1)); NOT_DEPLOYED+=("$1"); }
+
+# Is the application actually deployed? Asked once, by looking for the
+# Deployments the CD pipeline creates, and used to route the checks below.
+APP_DEPLOYED=0
+if [ "$(kubectl get deployment -n "$APP_NS" -o name 2>/dev/null | wc -l)" -gt 0 ]; then
+    APP_DEPLOYED=1
+fi
 
 check() { # check <description> <command...>
     local desc="$1"; shift
@@ -98,10 +119,43 @@ echo "-- exposure --"
 INGRESS_JSON=$(kubectl get ingress -n "$NAMESPACE" -o json 2>/dev/null)
 if [ -z "$INGRESS_JSON" ]; then
     bad "could not read Ingresses in ${NAMESPACE} — exposure could not be verified (this is not a pass)"
-elif printf '%s' "$INGRESS_JSON" | grep -qE '"name": *"[^"]*(prometheus|alertmanager)'; then
-    bad "Prometheus or Alertmanager has an Ingress — neither has ANY authentication"
 else
-    ok "Prometheus and Alertmanager have no Ingress"
+    # AUDIT FIX -- this asked whether any Ingress NAME CONTAINED the substring
+    # "prometheus" or "alertmanager". Grafana's Ingress is called
+    # kube-prometheus-stack-grafana, so the check failed on every healthy
+    # install, reporting that Prometheus was exposed when it was not.
+    #
+    # A security check that cries wolf is worse than none: it is the one you
+    # learn to skim past, so the day it is right you do not read it either.
+    #
+    # It now asks what it means to ask -- does any Ingress ROUTE TO the
+    # Prometheus or Alertmanager Service? -- by looking at backend service
+    # names, which is what actually determines exposure. Grafana's Ingress
+    # routes to kube-prometheus-stack-grafana and is correctly ignored.
+    EXPOSED=$(printf '%s' "$INGRESS_JSON" | python3 -c "
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+bad = []
+for item in d.get('items', []):
+    name = item['metadata']['name']
+    for rule in item.get('spec', {}).get('rules', []) or []:
+        for path in (rule.get('http', {}) or {}).get('paths', []) or []:
+            svc = ((path.get('backend', {}) or {}).get('service', {}) or {}).get('name', '')
+            if svc.endswith('-prometheus') or svc.endswith('-alertmanager'):
+                bad.append(f'{name} -> {svc}')
+    dflt = ((item.get('spec', {}).get('defaultBackend', {}) or {}).get('service', {}) or {}).get('name', '')
+    if dflt.endswith('-prometheus') or dflt.endswith('-alertmanager'):
+        bad.append(f'{name} -> {dflt}')
+print('; '.join(bad))
+" 2>/dev/null)
+    if [ -n "$EXPOSED" ]; then
+        bad "an Ingress routes to Prometheus or Alertmanager (${EXPOSED}) — neither has ANY authentication"
+    else
+        ok "no Ingress routes to Prometheus or Alertmanager"
+    fi
 fi
 check "Grafana has an Ingress" bash -c \
   "kubectl get ingress -n $NAMESPACE -o name | grep -q grafana"
@@ -156,7 +210,11 @@ fi
 echo ""
 echo "-- discovery --"
 for m in backend worker frontend; do
-    check "ServiceMonitor/${m} exists in ${APP_NS}" kubectl get servicemonitor "$m" -n "$APP_NS"
+    if [ "$APP_DEPLOYED" -eq 0 ]; then
+        pending "ServiceMonitor/${m} in ${APP_NS}"
+    else
+        check "ServiceMonitor/${m} exists in ${APP_NS}" kubectl get servicemonitor "$m" -n "$APP_NS"
+    fi
 done
 check "ServiceMonitor/jenkins exists in ${NAMESPACE}" kubectl get servicemonitor jenkins -n "$NAMESPACE"
 check "the platform PrometheusRule exists" kubectl get prometheusrule platform-slo-and-alerts -n "$NAMESPACE"
@@ -191,8 +249,14 @@ check "default-deny is in place" kubectl get networkpolicy default-deny-all -n "
 for np in prometheus alertmanager grafana exporters; do
     check "NetworkPolicy/${np} exists" kubectl get networkpolicy "$np" -n "$NAMESPACE"
 done
+if [ "$APP_DEPLOYED" -eq 0 ]; then
+    pending "the ${APP_NS} NetworkPolicy admitting scraping"
+else
 check "the app namespace admits scraping from ${NAMESPACE}" bash -c \
   "kubectl get networkpolicy backend -n $APP_NS -o yaml | grep -q '$NAMESPACE'"
+fi
+# Jenkins is installed by deploy.sh, not by the CD pipeline, so this one does
+# not depend on the application being deployed.
 check "Jenkins agents may reach ${NAMESPACE}" bash -c \
   "kubectl get networkpolicy jenkins-agents -n $JENKINS_NS -o yaml | grep -q '$NAMESPACE'"
 
@@ -222,6 +286,7 @@ try: d=json.load(sys.stdin)
 except Exception: print(-1); raise SystemExit
 print(len(d['data']['result']) if d.get('status')=='success' else -1)" 2>/dev/null || echo -1)
         if [ "${N:-0}" -gt 0 ]; then ok "target ${job} is being scraped (${N} instance(s))"
+        elif [ "$APP_DEPLOYED" -eq 0 ]; then pending "target ${job}"
         else bad "target ${job} has no 'up' series"; fi
     done
     R=$(query 'app_build_info')
@@ -231,6 +296,7 @@ try: d=json.load(sys.stdin)
 except Exception: print(0); raise SystemExit
 print(len(d['data']['result']) if d.get('status')=='success' else 0)" 2>/dev/null || echo 0)
     if [ "${N:-0}" -gt 0 ]; then ok "app_build_info is reported by ${N} pod(s)"
+    elif [ "$APP_DEPLOYED" -eq 0 ]; then pending "app_build_info"
     else bad "app_build_info is absent — the commit -> dashboard chain is broken"; fi
 
     # The Jenkins queue metric must exist under the single-prefix name.
@@ -275,9 +341,22 @@ if [ -n "$PF_PID" ]; then kill "$PF_PID" 2>/dev/null || true; fi
 # ------------------------------------------------------------- result
 echo ""
 echo "=================================================="
-echo "  ${PASS} passed, ${FAIL} failed, ${SKIP} skipped"
+echo "  ${PASS} passed, ${FAIL} failed, ${SKIP} skipped, ${PENDING} not deployed yet"
 if [ "$FAIL" -gt 0 ]; then
-    printf '  FAILED: %s\n' "${FAILED[@]}"
+    printf '  FAILED:  %s\n' "${FAILED[@]}"
+fi
+if [ "$PENDING" -gt 0 ]; then
+    echo ""
+    echo "  Not deployed yet — these belong to the application, which deploy.sh"
+    echo "  does not deploy. The CD pipeline does. They are not failures and not"
+    echo "  passes; they are unverified until a release has run:"
+    printf '  PENDING: %s\n' "${NOT_DEPLOYED[@]}"
+    echo ""
+    echo "  Run application-ci in Jenkins, let it trigger application-cd, then"
+    echo "  re-run this script. Everything above should then be checked for real."
 fi
 echo "=================================================="
+# Exit on FAIL only. "Not deployed yet" must not fail a deploy that has not got
+# to the deploying part -- but it is printed loudly enough that it cannot be
+# mistaken for everything having been verified.
 exit "$FAIL"

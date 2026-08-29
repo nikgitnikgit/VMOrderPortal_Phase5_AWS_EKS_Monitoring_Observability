@@ -143,6 +143,31 @@ check "job application-cd exists" bash -c \
     "kubectl exec -n jenkins jenkins-0 -c jenkins -- curl -sS -g --user 'admin:${JPASS}' \
      'http://localhost:8080/api/json?tree=jobs[name]' | grep -q application-cd"
 
+# AUDIT FIX -- "the job exists" is a much weaker claim than it looks.
+#
+# application-ci is a MULTIBRANCH job: it exists as an empty folder from the
+# moment JCasC creates it, whether or not it can build anything. When
+# github_repo_url still held the example placeholder, Jenkins was watching a
+# repository that does not exist, the folder was empty, no branch was
+# discoverable and no build could ever run -- and both checks above passed.
+#
+# A CI system that cannot build is not a working CI system. This asserts the
+# scan actually found something. The scan log is quoted on failure because the
+# usual cause says "Invalid scan credentials", which sounds like a credentials
+# problem and is normally a wrong repository.
+check "application-ci discovered at least one branch" bash -c \
+    "N=\$(kubectl exec -n jenkins jenkins-0 -c jenkins -- curl -sS -g --user 'admin:${JPASS}' \
+        'http://localhost:8080/job/application-ci/api/json?tree=jobs[name]' \
+        | python3 -c \"
+import json,sys
+try: print(len(json.load(sys.stdin).get('jobs',[])))
+except Exception: print(0)\");
+     if [ \"\${N:-0}\" -gt 0 ]; then exit 0; fi
+     echo 'application-ci has no branches: it exists but cannot build anything.'
+     echo 'Check Scan Repository Log in the UI, and that github_repo_url names a'
+     echo 'real repository:  terraform -chdir=terraform output -raw github_repo_url'
+     exit 1"
+
 # ------------------------------------------------------------- pipelines
 echo ""
 echo "Pipeline separation"
