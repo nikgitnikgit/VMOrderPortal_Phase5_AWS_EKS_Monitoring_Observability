@@ -1828,6 +1828,9 @@ t T18.47 "every test ID is unique" bash -c '
 t T18.46 "documented node counts match what Terraform creates" \
   python3 tests/check_node_count.py
 
+t T18.48 "every Trivy exception is scoped, justified, dated and wired in" \
+  python3 tests/check_trivy_exceptions.py
+
 t T18.40 "no diagram names a metric that nothing produces" python3 -c "
 import glob, re, subprocess, sys
 

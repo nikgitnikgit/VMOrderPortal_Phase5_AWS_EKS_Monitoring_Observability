@@ -420,6 +420,37 @@ report and a CycloneDX SBOM are archived on every build. The agent image is
 also rebuilt with `apt-get upgrade` and a current Helm binary, which is what
 removed the 6 fixable CRITICALs the first scan found.
 
+**One vulnerability exception, in `jenkins/agent-tools/.trivyignore.yaml`.**
+`CVE-2026-56854` (golang.org/x/crypto ≤ v0.54.0) is reported CRITICAL and
+`fixed` against the `helm` and `promtool` binaries, so `--ignore-unfixed` does
+not suppress it and the agent image build stops. The affected symbol is
+`ssh.NewServerConn`: the bug is that a `source-address` restriction returned by
+an auth callback was enforced for only two of six callback families. It is an
+SSH **server** authorisation defect, and neither helm nor promtool implements an
+SSH server. Trivy scans Go binaries at module granularity and cannot tell
+"links the library" from "calls the vulnerable function" — `govulncheck` can.
+Nothing to upgrade to exists yet: helm v3.21.4 (2026-08-14) and prometheus
+v3.14.0 (2026-08-17) are both the newest in their lines and both predate
+x/crypto v0.55.0.
+
+The exception is scoped to those two paths, carries a written justification,
+and **expires on 2026-11-07**. It lives beside the Dockerfile rather than at the
+repository root — Trivy auto-discovers `.trivyignore.yaml` from the working
+directory, and a root-level copy would silently apply to the application image
+scan too. `scripts/install-jenkins.sh` passes it with `--ignorefile`, and
+`tests/check_trivy_exceptions.py` (T18.48) fails the suite if the entry loses
+its scope, its justification or its expiry date, if it is moved to the root, if
+any Trivy invocation stops passing `--ignorefile`, or from **21 days before**
+the expiry — so the reminder lands as a test failure at a desk rather than as a
+failed deploy. Deleting the file always passes that check; that is the intended
+end state, once the pinned versions move past x/crypto v0.55.0.
+
+The application image gate in `Jenkinsfile-ci` takes **no** exceptions, and
+T18.48 enforces that too. Those images — `nginx-unprivileged:alpine` and
+`python:3.12-slim` — contain no Go binaries, so they cannot carry this finding
+and have no reason to inherit the exception. The check fails if a CI scan ever
+starts passing `--ignorefile`, and if the CI scan disappears altogether.
+
 **Two documented exceptions, both scoped to the `buildkit` container only:**
 `seccompProfile: Unconfined`, an AppArmor `unconfined` annotation, and
 `--oci-worker-no-process-sandbox`. Rootless BuildKit cannot otherwise create

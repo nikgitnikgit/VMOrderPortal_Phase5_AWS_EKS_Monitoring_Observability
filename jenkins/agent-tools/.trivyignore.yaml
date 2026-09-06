@@ -1,0 +1,88 @@
+# jenkins/agent-tools/.trivyignore.yaml
+#
+# THE ONE SECURITY EXCEPTION IN THIS PROJECT. It is narrow, justified, dated,
+# and enforced by tests/check_trivy_exceptions.py — which fails the suite when
+# any of those four stop being true.
+#
+# WHY THIS FILE EXISTS
+#
+# On 2026-09-06 the agent image build failed its Trivy CRITICAL gate:
+#
+#   usr/local/bin/helm      golang.org/x/crypto v0.54.0  CVE-2026-56854  CRITICAL  fixed
+#   usr/local/bin/promtool  golang.org/x/crypto v0.54.0  CVE-2026-56854  CRITICAL  fixed
+#
+# The gate was right to fire. The finding has a fix (v0.55.0), so
+# --ignore-unfixed does not suppress it, and that is exactly the behaviour we
+# want: a CRITICAL with a patch available should stop a build.
+#
+# WHY IT IS NOT REACHABLE HERE
+#
+# The Go vulnerability database records this at symbol level, not package
+# level. The affected symbol is:
+#
+#     golang.org/x/crypto/ssh.NewServerConn
+#
+# The bug is that a `source-address` critical option returned by an
+# authentication callback was enforced only for PublicKeyCallback and
+# VerifiedPublicKeyCallback, and silently ignored for PasswordCallback,
+# KeyboardInteractiveCallback, NoClientAuthCallback and
+# GSSAPIWithMICConfig.AllowLogin. It is a defect in SSH *server* authorisation.
+#
+# helm and promtool do not implement an SSH server. Neither calls
+# NewServerConn; x/crypto is linked in for unrelated reasons. Trivy scans
+# gobinary targets at module granularity and cannot see that, so it reports the
+# module version and is unable to distinguish "links the library" from "calls
+# the vulnerable function". `govulncheck` does make that distinction — it is
+# the tool to reach for if this is ever challenged.
+#
+# WHY WE ARE NOT SIMPLY UPGRADING
+#
+# Because there is nothing to upgrade to, as of 2026-09-06:
+#
+#   golang.org/x/crypto v0.55.0   the fix          released ~2026-08/09
+#   helm v3.21.4                  2026-08-14       ships x/crypto v0.54.0, newest 3.x
+#   prometheus v3.14.0            2026-08-17       predates the fix
+#
+# Both tools are pinned at the newest release their line has, and both were
+# built before the fix existed. This resolves itself upstream: the next helm
+# 3.21.x and the next prometheus 3.x will carry v0.55.0 or later, the ARGs in
+# the Dockerfile get bumped, and this file is deleted.
+#
+# Helm 4.x is not the answer either. That is a major-version jump the
+# Dockerfile refuses on purpose — see the long comment above ARG HELM_VERSION.
+#
+# SCOPE — READ THIS BEFORE COPYING THE FILE ANYWHERE
+#
+# This file lives in jenkins/agent-tools/ and NOT at the repository root, and it
+# is passed to Trivy explicitly with --ignorefile by scripts/install-jenkins.sh.
+# Trivy auto-discovers .trivyignore.yaml from the working directory, so a
+# root-level copy would silently apply to the APPLICATION image scan in
+# Jenkinsfile-ci as well. The application images contain no Go binaries and have
+# no business inheriting a Go exception. check_trivy_exceptions.py asserts the
+# file is not at the root.
+#
+# IF THIS STOPS SUPPRESSING THE FINDING
+#
+# The `paths` scoping below fails CLOSED: if the path strings ever stop matching
+# what Trivy reports, the rule does not apply, the finding comes back, and the
+# build stops. That is the safe direction. Should it happen, check the Target
+# column in the Trivy output and correct the paths — do not delete them and
+# leave a bare `id`, which would suppress this CVE everywhere in the image.
+vulnerabilities:
+  - id: CVE-2026-56854
+    paths:
+      - usr/local/bin/helm
+      - usr/local/bin/promtool
+    statement: >-
+      golang.org/x/crypto/ssh v0.54.0, reachable only through
+      ssh.NewServerConn. helm and promtool are CLI clients and never start an
+      SSH server, so the vulnerable authorisation path cannot be entered.
+      Fixed in x/crypto v0.55.0; no helm 3.x or prometheus 3.x release built
+      against it exists yet. Remove this entry when the Dockerfile's
+      HELM_VERSION and PROMTOOL_VERSION are bumped past that point.
+    # NOT open-ended. After this date Trivy stops honouring the rule and the
+    # build fails again, which forces someone to re-check upstream rather than
+    # letting a temporary exception quietly become permanent.
+    # tests/check_trivy_exceptions.py fails the suite 21 days BEFORE this date,
+    # so the reminder arrives with time to act instead of mid-deploy.
+    expired_at: 2026-11-07

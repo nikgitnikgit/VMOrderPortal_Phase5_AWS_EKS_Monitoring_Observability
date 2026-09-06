@@ -212,13 +212,35 @@ else
     # "will_not_fix"). Failing on those means the gate can NEVER pass, and the
     # usual outcome is that someone disables scanning altogether. We fail on
     # anything that HAS a fix, and record the rest in the report.
+    # One documented exception, passed explicitly rather than auto-discovered.
+    #
+    # Trivy picks up .trivyignore.yaml from the working directory on its own.
+    # Relying on that would mean the exception applied wherever Trivy happened
+    # to be run from — including Jenkinsfile-ci's scan of the APPLICATION
+    # images, which contain no Go binaries and must not inherit a Go exception.
+    # So the file lives beside the Dockerfile it describes and is named here.
+    # tests/check_trivy_exceptions.py asserts both halves of that arrangement.
+    TRIVY_IGNORE="$REPO_ROOT/jenkins/agent-tools/.trivyignore.yaml"
+    if [ ! -f "$TRIVY_IGNORE" ]; then
+        echo "ERROR: ${TRIVY_IGNORE} is missing." >&2
+        echo "Scanning without it would either fail on a finding that file" >&2
+        echo "documents, or — worse — pass while nobody knows why." >&2
+        exit 1
+    fi
+
     echo "  scanning agent image..."
     if command -v trivy >/dev/null 2>&1; then
         trivy image --severity CRITICAL --ignore-unfixed --exit-code 1 \
+            --ignorefile "$TRIVY_IGNORE" \
             --no-progress "$TOOLS_IMAGE"
     else
+        # The ignore file is on the host; Trivy is in a container. Without the
+        # mount, --ignorefile points at nothing, Trivy carries on, and the scan
+        # fails on the documented finding for a reason that looks unrelated.
         docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "${TRIVY_IGNORE}:/tmp/.trivyignore.yaml:ro" \
             aquasec/trivy:0.58.2@sha256:665030f4d33a82c1e8d9d5e0453365842236723c1ee5cc3becca698268e66a56 image --severity CRITICAL --ignore-unfixed \
+            --ignorefile /tmp/.trivyignore.yaml \
             --exit-code 1 --no-progress "$TOOLS_IMAGE"
     fi
 
