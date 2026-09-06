@@ -80,6 +80,31 @@ spec:
               kubernetes.io/metadata.name: {{ .Values.jenkins.namespace }}
       ports:
         - port: 8080        # the Jenkins /prometheus endpoint
+    # CoreDNS metrics, on 9153 in kube-system.
+    #
+    # AUDIT FIX -- these two targets were DOWN from the day the stack was
+    # installed. The chart ships a coredns ServiceMonitor by default, and this
+    # policy had no rule that admitted it: port 53 above is DNS RESOLUTION, a
+    # different port and a different purpose from the metrics endpoint. Every
+    # scrape timed out with "context deadline exceeded" -- the signature of a
+    # NetworkPolicy DROP, which times out rather than refusing, so it reads
+    # like a slow endpoint rather than a blocked one.
+    #
+    # Nothing alerted, correctly: PrometheusTargetDown is scoped to our own
+    # namespaces and the CD gate counts only the application namespace. So the
+    # cost was not a missed page, it was two permanently red rows on the
+    # targets page -- which is how a targets page stops being read at all.
+    #
+    # Kept to the metrics port, in the style of the rules above: DNS failures
+    # surface as application errors with confusing symptoms, so these metrics
+    # earn their place, but Prometheus still has no business anywhere else in
+    # kube-system.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 9153
     # Its own namespace: kube-state-metrics, node-exporter, Alertmanager,
     # Grafana, the operator, and itself.
     - to:

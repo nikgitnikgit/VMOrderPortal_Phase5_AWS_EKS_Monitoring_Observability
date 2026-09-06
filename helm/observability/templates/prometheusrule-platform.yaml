@@ -222,7 +222,7 @@ spec:
               Either the controller is down or the scrape path is broken. Both
               mean no release can be made and no build metric is being
               recorded.
-            runbook_url: "{{ .Values.runbookBaseUrl }}/JenkinsQueueStuck.md"
+            runbook_url: "{{ .Values.runbookBaseUrl }}/JenkinsDown.md"
 
     # =======================================================================
     - name: monitoring.alerts
@@ -285,7 +285,7 @@ spec:
               retentionSize should be trimming blocks before this happens. If
               it is not, either the setting was raised above the volume size or
               series churn is higher than the sizing assumed.
-            runbook_url: "{{ .Values.runbookBaseUrl }}/PrometheusTargetDown.md"
+            runbook_url: "{{ .Values.runbookBaseUrl }}/PrometheusStorageFillingUp.md"
 
         - alert: AlertmanagerNotificationsFailing
           # The alert about the alerts. Without it, a broken SNS receiver is
@@ -303,4 +303,4 @@ spec:
               Alerts are firing and nobody is being told. Usually the IRSA role
               annotation on the alertmanager ServiceAccount, or the SNS topic
               ARN, or egress on 443 from the observability namespace.
-            runbook_url: "{{ .Values.runbookBaseUrl }}/PrometheusTargetDown.md"
+            runbook_url: "{{ .Values.runbookBaseUrl }}/AlertmanagerNotificationsFailing.md"

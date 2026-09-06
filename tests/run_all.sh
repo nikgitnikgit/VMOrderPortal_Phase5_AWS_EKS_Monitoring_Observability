@@ -1794,12 +1794,13 @@ t T18.41 "every runbook_url is built from the single configured base" bash -c '
     https://github.com/*/blob/main/docs/runbooks) ;;
     *) echo "runbookBaseUrl is ${base} — expected a github blob URL ending in /docs/runbooks"; exit 1 ;;
   esac
-  # And every file it points at must exist, by the same name.
-  helm template observability helm/observability \
-    | grep -o "runbook_url:.*" | sed "s|.*/docs/runbooks/||; s|\"$||" | sort -u \
-    | while read -r f; do
-        [ -f "docs/runbooks/$f" ] || { echo "runbook_url names docs/runbooks/$f, which does not exist"; exit 1; }
-      done
+  # File existence and alert/runbook pairing moved to T18.52.
+  #
+  # The check that used to live here could not fail. It piped into a `while`,
+  # so its `exit 1` ended a SUBSHELL, and the `echo` that followed reset the
+  # status to 0 -- it printed "does not exist" and returned success. It was
+  # also asking the weaker question: three alerts pointed at other alerts
+  # runbooks, and all three of those files existed.
   echo "all runbook_urls derive from ${base}"'
 
 # The shipped NodeNotReadyOrPressure alert description told an on-call person
@@ -1830,6 +1831,9 @@ t T18.46 "documented node counts match what Terraform creates" \
 
 t T18.48 "every Trivy exception is scoped, justified, dated and wired in" \
   python3 tests/check_trivy_exceptions.py
+
+t T18.52 "every alert links to its own runbook, and that runbook exists" \
+  python3 tests/check_runbook_links.py
 
 t T18.49 "meta-alerts are null-routed and InfoInhibitor actually inhibits" \
   python3 tests/check_alert_routing.py
@@ -1864,27 +1868,89 @@ t T18.50 "port-forward tells 'cannot ask' apart from 'not there'" bash -c '
 # regression this guards against is the one that happened.
 t T18.51 "port-forward resolves the Services the chart really creates" bash -c '
   d=$(mktemp -d); trap "rm -rf $d" EXIT
+  # Free ports, chosen at run time. The first version of this test hardcoded
+  # 9090/9093 and therefore asserted "those ports are free on this machine" as
+  # much as anything about the script -- it passed locally and failed in a
+  # sandbox where something already listened on 9090.
+  # Free ports found with bash /dev/tcp -- no nested quoting, no python -c
+  # inside a single-quoted bash -c, which is how the first attempt at this
+  # ended up passing 127.0.0.1 to python unquoted.
+  free_port() {
+    local c cand
+    for c in $(seq 1 60); do
+      cand=$((20000 + RANDOM % 20000))
+      (exec 3<>/dev/tcp/127.0.0.1/$cand) 2>/dev/null || { echo "$cand"; return 0; }
+      exec 3>&- 2>/dev/null || true
+    done
+    echo 0
+  }
+  pp=$(free_port); ap=$(free_port)
+  [ "$pp" != "0" ] && [ "$ap" != "0" ] && [ "$pp" != "$ap" ] || {
+    echo "could not find two free ports to test with"; exit 1; }
   cat > "$d/kubectl" <<STUB
 #!/bin/bash
 case "\$*" in
   *"-l app=kube-prometheus-stack-prometheus"*)   printf kube-prometheus-stack-prometheus; exit 0;;
   *"-l app=kube-prometheus-stack-alertmanager"*) printf kube-prometheus-stack-alertmanager; exit 0;;
-  *"-l app.kubernetes.io/name=prometheus"*)      exit 0;;
-  *"-l app.kubernetes.io/name=alertmanager"*)    exit 0;;
-  *"port-forward"*) sleep 60;;
+  *"port-forward"*)
+      # Serve on the local half of "LOCAL:REMOTE" so the readiness probe has
+      # something real to talk to, exactly as a working forward would.
+      # Held in a variable, not a shared file: both forwards run at once, and
+      # the first version had them racing to write one $d/port -- Alertmanager
+      # read Prometheus port and never came up.
+      lp=""
+      for a in "\$@"; do case "\$a" in [0-9]*:[0-9]*) lp="\${a%%:*}";; esac; done
+      exec python3 -m http.server "\$lp" --bind 127.0.0.1 >/dev/null 2>&1;;
   *) exit 0;;
 esac
 STUB
   chmod +x "$d/kubectl"
-  PATH="$d:$PATH" timeout 8 bash scripts/port-forward-monitoring.sh > "$d/out" 2>&1
+  PROM_PORT=$pp ALERT_PORT=$ap PATH="$d:$PATH" \
+    timeout 25 bash scripts/port-forward-monitoring.sh > "$d/out" 2>&1
   rc=$?
   if [ "$rc" != "124" ]; then
     echo "script exited $rc against real chart labels; it should still be running"
     cat "$d/out"; exit 1
   fi
-  grep -q "localhost:9090" "$d/out" || { echo "no Prometheus URL printed"; exit 1; }
-  grep -q "localhost:9093" "$d/out" || { echo "no Alertmanager URL printed"; exit 1; }
+  grep -q "localhost:$pp" "$d/out" || { echo "no Prometheus URL printed"; cat "$d/out"; exit 1; }
+  grep -q "localhost:$ap" "$d/out" || { echo "no Alertmanager URL printed"; cat "$d/out"; exit 1; }
   echo "both Services resolved from the chart-created labels"'
+
+t T18.53 "port-forward proves the endpoint answers, not that a PID exists" bash -c '
+  d=$(mktemp -d); trap "rm -rf $d" EXIT
+  # Free ports found with bash /dev/tcp -- no nested quoting, no python -c
+  # inside a single-quoted bash -c, which is how the first attempt at this
+  # ended up passing 127.0.0.1 to python unquoted.
+  free_port() {
+    local c cand
+    for c in $(seq 1 60); do
+      cand=$((20000 + RANDOM % 20000))
+      (exec 3<>/dev/tcp/127.0.0.1/$cand) 2>/dev/null || { echo "$cand"; return 0; }
+      exec 3>&- 2>/dev/null || true
+    done
+    echo 0
+  }
+  pp=$(free_port); ap=$(free_port)
+  [ "$pp" != "0" ] && [ "$ap" != "0" ] && [ "$pp" != "$ap" ] || {
+    echo "could not find two free ports to test with"; exit 1; }
+  cat > "$d/kubectl" <<STUB
+#!/bin/bash
+case "\$*" in
+  *"-l app=kube-prometheus-stack-prometheus"*)   printf kube-prometheus-stack-prometheus; exit 0;;
+  *"-l app=kube-prometheus-stack-alertmanager"*) printf kube-prometheus-stack-alertmanager; exit 0;;
+  *"port-forward"*) echo "Unable to listen on port: address already in use" >&2; exit 1;;
+  *) exit 0;;
+esac
+STUB
+  chmod +x "$d/kubectl"
+  out=$(PROM_PORT=$pp ALERT_PORT=$ap PATH="$d:$PATH" \
+        timeout 90 bash scripts/port-forward-monitoring.sh 2>&1); rc=$?
+  [ "$rc" = "1" ] || { echo "a forward that never bound exited $rc, expected 1"; echo "$out"; exit 1; }
+  case "$out" in *"localhost:$pp"*)
+    echo "advertised a URL for a port-forward that never bound"; exit 1;; esac
+  case "$out" in *"address already in use"*) ;; *)
+    echo "kubectl real error was swallowed"; exit 1;; esac
+  echo "a dead forward fails and its error is shown, no URL advertised"'
 
 t T18.40 "no diagram names a metric that nothing produces" python3 -c "
 import glob, re, subprocess, sys

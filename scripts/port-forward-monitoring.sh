@@ -121,38 +121,88 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-kubectl port-forward -n "$NAMESPACE" "svc/${PROM_SVC}" "${PROM_PORT}:9090" >/dev/null &
+# AUDIT FIX 3 -- `kill -0` CANNOT TELL A LIVE PROCESS FROM A DEAD ONE.
+#
+# The previous guard was `kill -0 "$PROM_PID"`. A background child that exits
+# becomes a ZOMBIE until the shell reaps it, and its PID stays in the process
+# table, so `kill -0` returns success for a process that is already gone. The
+# check passed on a dead forward every single time.
+#
+# Observed: with a forward already running on 9090/9093 from an earlier shell,
+# both of this script's forwards died instantly with "address already in use",
+# both `kill -0` checks passed, and the banner advertised two endpoints the
+# script did not own. The comment on the old check said it existed so the
+# script "cannot report an endpoint that does not answer". It could not tell.
+#
+# An earlier fix here noticed that only Prometheus was being checked and added
+# the same check for Alertmanager -- duplicating a guard that never worked
+# rather than asking whether it worked. The lesson is the one this project
+# keeps relearning: test the guard, not just the thing it guards.
+#
+# So: ASK THE ENDPOINT. A port-forward is either answering HTTP or it is not,
+# and that is a question with a real answer.
+STDERR_DIR=$(mktemp -d)
+kubectl port-forward -n "$NAMESPACE" "svc/${PROM_SVC}" "${PROM_PORT}:9090" \
+    >/dev/null 2>"${STDERR_DIR}/prom" &
 PROM_PID=$!
 
 if [ -n "$ALERT_SVC" ]; then
-    kubectl port-forward -n "$NAMESPACE" "svc/${ALERT_SVC}" "${ALERT_PORT}:9093" >/dev/null &
+    kubectl port-forward -n "$NAMESPACE" "svc/${ALERT_SVC}" "${ALERT_PORT}:9093" \
+        >/dev/null 2>"${STDERR_DIR}/alert" &
     ALERT_PID=$!
 fi
 
-sleep 2
+# Poll rather than sleep-and-hope. The old `sleep 2` was also a guess: on a
+# slower link the tunnel is not up yet and the first curl gets connection
+# refused, which is how an empty reply reached a JSON parser and produced a
+# stack trace about "line 1 column 1".
+endpoint_ready() { # endpoint_ready <port> <path>
+    local _i
+    for _i in $(seq 1 30); do
+        if command -v curl >/dev/null 2>&1; then
+            if curl -sS -o /dev/null --max-time 2 \
+                 "http://localhost:${1}${2}" 2>/dev/null; then return 0; fi
+        else
+            # No curl: a TCP connect is weaker than an HTTP round trip, but it
+            # is still an answer from the listener rather than a guess about a
+            # PID. Said out loud rather than silently substituted.
+            if (exec 3<>"/dev/tcp/127.0.0.1/${1}") 2>/dev/null; then
+                exec 3>&- 2>/dev/null || true
+                return 0
+            fi
+        fi
+        sleep 0.5
+    done
+    return 1
+}
 
-# Confirm it actually came up rather than printing a URL that does not answer.
-# A port-forward that fails to bind exits immediately and would otherwise leave
-# this script cheerfully reporting two working endpoints.
-if ! kill -0 "$PROM_PID" 2>/dev/null; then
-    echo "ERROR: the Prometheus port-forward exited immediately." >&2
-    echo "Usually port ${PROM_PORT} is already in use." >&2
+if ! endpoint_ready "$PROM_PORT" "/-/ready"; then
+    echo "ERROR: the Prometheus port-forward is not answering on ${PROM_PORT}." >&2
+    if [ -s "${STDERR_DIR}/prom" ]; then
+        echo "" >&2
+        echo "kubectl said:" >&2
+        sed 's/^/  /' "${STDERR_DIR}/prom" >&2
+    fi
+    echo "" >&2
+    echo "If the port is in use, another port-forward is probably still running:" >&2
+    echo "  ss -ltn | grep -E '${PROM_PORT}|${ALERT_PORT}'" >&2
+    echo "  pkill -f 'kubectl port-forward'      # or reuse the one you have" >&2
+    echo "Or pick different ports:  PROM_PORT=19090 ALERT_PORT=19093 $0" >&2
+    rm -rf "$STDERR_DIR"
     exit 1
 fi
-# AUDIT FIX -- the Alertmanager forward was never checked, only Prometheus's.
-#
-# The comment above says this exists so the script cannot report an endpoint
-# that does not answer, and then the URL printed below was gated on $ALERT_SVC
-# -- a string set before the fork, which is true whether or not the forward
-# survived. Port 9093 already in use meant the forward died instantly and the
-# script still advertised http://localhost:9093, which is precisely the failure
-# it was written to prevent, one variable to the left.
-if [ -n "${ALERT_PID:-}" ] && ! kill -0 "$ALERT_PID" 2>/dev/null; then
-    echo "WARNING: the Alertmanager port-forward exited immediately;" >&2
-    echo "         port ${ALERT_PORT} is probably already in use." >&2
+
+# Alertmanager is not fatal -- Prometheus alone is useful -- but the URL is
+# printed only if it actually answers.
+if [ -n "${ALERT_PID:-}" ] && ! endpoint_ready "$ALERT_PORT" "/-/ready"; then
+    echo "WARNING: the Alertmanager port-forward is not answering on ${ALERT_PORT}." >&2
+    if [ -s "${STDERR_DIR}/alert" ]; then
+        sed 's/^/  /' "${STDERR_DIR}/alert" >&2
+    fi
     echo "         Prometheus is still available below." >&2
     ALERT_PID=""
 fi
+rm -rf "$STDERR_DIR"
 
 echo "=================================================="
 echo "  Prometheus    http://localhost:${PROM_PORT}"
