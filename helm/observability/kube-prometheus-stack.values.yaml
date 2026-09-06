@@ -194,12 +194,35 @@ alertmanager:
         # pipeline works end to end, and it must not reach the inbox.
         - matchers: ["alertname = Watchdog"]
           receiver: "null"
+        # The chart's OTHER meta-alert, and the one this config forgot.
+        #
+        # InfoInhibitor says nothing about the system. It fires whenever an
+        # info-severity alert is active in a namespace, and exists solely to be
+        # the SOURCE of the inhibition below -- it is machinery, not a message.
+        # Upstream null-routes it next to Watchdog; we null-routed Watchdog and
+        # missed this one, so every info-level blip in any namespace arrived as
+        # a FIRING/RESOLVED pair in the inbox. Two emails about the Jenkins
+        # namespace during a CD run is how an operator learns to skim past
+        # alerts, which is the one thing a monitoring project cannot afford.
+        #
+        # Null-routing does NOT stop it inhibiting: inhibit_rules are evaluated
+        # against every alert Alertmanager holds, whatever receiver it routes
+        # to. It goes on doing its job, silently, which is the job.
+        - matchers: ["alertname = InfoInhibitor"]
+          receiver: "null"
     inhibit_rules:
       # A critical and a warning about the same thing in the same namespace is
       # one problem. Send the critical; suppress the warning.
       - source_matchers: ["severity = critical"]
         target_matchers: ["severity = warning"]
         equal: ["alertname", "namespace"]
+      # What InfoInhibitor is FOR, and what was missing. Without this rule the
+      # alert fired, emailed, and achieved nothing: info-level alerts were
+      # never actually suppressed. With it, an info alert in a namespace that
+      # already has a warning or critical is held back as duplicate detail.
+      - source_matchers: ["alertname = InfoInhibitor"]
+        target_matchers: ["severity = info"]
+        equal: ["namespace"]
     receivers:
       - name: "null"
       - name: sns

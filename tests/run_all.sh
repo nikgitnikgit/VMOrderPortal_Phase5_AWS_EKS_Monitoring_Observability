@@ -1831,6 +1831,61 @@ t T18.46 "documented node counts match what Terraform creates" \
 t T18.48 "every Trivy exception is scoped, justified, dated and wired in" \
   python3 tests/check_trivy_exceptions.py
 
+t T18.49 "meta-alerts are null-routed and InfoInhibitor actually inhibits" \
+  python3 tests/check_alert_routing.py
+
+# Behavioural, not a grep: the script is RUN against a kubectl that fails and a
+# kubectl that succeeds but finds nothing, and the two must not be conflated.
+# Reported as "no Prometheus Service -- is the stack installed?", an
+# unreachable cluster sent the operator to reinstall a stack that was at that
+# moment emailing him alerts from inside that same cluster.
+t T18.50 "port-forward tells 'cannot ask' apart from 'not there'" bash -c '
+  d=$(mktemp -d); trap "rm -rf $d" EXIT
+  printf "#!/bin/bash\necho \"dial tcp: i/o timeout\" >&2\nexit 1\n" > "$d/kubectl"
+  chmod +x "$d/kubectl"
+  out=$(PATH="$d:$PATH" bash scripts/port-forward-monitoring.sh 2>&1); rc=$?
+  [ "$rc" = "2" ] || { echo "unreachable cluster exited $rc, expected 2"; exit 1; }
+  case "$out" in *[Ii]s\ the\ stack\ installed*)
+    echo "an unreachable cluster was reported as a missing stack"; exit 1;; esac
+  printf "#!/bin/bash\nexit 0\n" > "$d/kubectl"; chmod +x "$d/kubectl"
+  out=$(PATH="$d:$PATH" bash scripts/port-forward-monitoring.sh 2>&1); rc=$?
+  [ "$rc" = "1" ] || { echo "absent service exited $rc, expected 1"; exit 1; }
+  case "$out" in *install-observability*) ;; *)
+    echo "a genuinely missing stack did not point at the installer"; exit 1;; esac
+  echo "query failure exits 2, genuine absence exits 1"'
+
+# The selector this script used matched NOTHING on a real cluster and had never
+# matched: Services are labelled by the Helm chart (legacy `app=` key only)
+# while StatefulSets and PVCs are labelled by the operator
+# (app.kubernetes.io/name). The same selector is correct in
+# verify-observability.sh and wrong here, which is why copying it looked safe.
+#
+# Driven by a stub kubectl reproducing chart 86.1.0's ACTUAL labels, so the
+# regression this guards against is the one that happened.
+t T18.51 "port-forward resolves the Services the chart really creates" bash -c '
+  d=$(mktemp -d); trap "rm -rf $d" EXIT
+  cat > "$d/kubectl" <<STUB
+#!/bin/bash
+case "\$*" in
+  *"-l app=kube-prometheus-stack-prometheus"*)   printf kube-prometheus-stack-prometheus; exit 0;;
+  *"-l app=kube-prometheus-stack-alertmanager"*) printf kube-prometheus-stack-alertmanager; exit 0;;
+  *"-l app.kubernetes.io/name=prometheus"*)      exit 0;;
+  *"-l app.kubernetes.io/name=alertmanager"*)    exit 0;;
+  *"port-forward"*) sleep 60;;
+  *) exit 0;;
+esac
+STUB
+  chmod +x "$d/kubectl"
+  PATH="$d:$PATH" timeout 8 bash scripts/port-forward-monitoring.sh > "$d/out" 2>&1
+  rc=$?
+  if [ "$rc" != "124" ]; then
+    echo "script exited $rc against real chart labels; it should still be running"
+    cat "$d/out"; exit 1
+  fi
+  grep -q "localhost:9090" "$d/out" || { echo "no Prometheus URL printed"; exit 1; }
+  grep -q "localhost:9093" "$d/out" || { echo "no Alertmanager URL printed"; exit 1; }
+  echo "both Services resolved from the chart-created labels"'
+
 t T18.40 "no diagram names a metric that nothing produces" python3 -c "
 import glob, re, subprocess, sys
 
