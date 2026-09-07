@@ -132,19 +132,35 @@ if defaults and defaults[0].get("uid") != "prometheus":
         "the default datasource uid must be 'prometheus' — every panel in dashboards/*.json "
         "references it by that uid and would render 'Datasource not found'")
 
-# 12. The Alertmanager config must contain no Go template delimiters.
+# 12. Go template delimiters in alertmanager.config require tplConfig pinned.
 #
-#     This file is a Helm VALUES file and the chart may render
-#     alertmanager.config through `tpl`. Alertmanager's own templates use the
-#     same {{ }} delimiters, so Helm evaluates them, finds no template of that
-#     name, and aborts the install. Alertmanager's defaults are identical to
-#     what those lines were setting, so the rule is simply: none here.
+#     THIS RULE USED TO SAY "no {{ here, take Alertmanager's default instead",
+#     AND THAT ADVICE CAUSED AN OUTAGE.
+#
+#     The hazard it names is real: this is a Helm VALUES file, the chart can
+#     render alertmanager.config through `tpl`, and Helm and Alertmanager share
+#     the {{ }} delimiter. But the remedy was wrong. Deleting the `subject` key
+#     does not give you a short subject, it gives you Alertmanager's default
+#     one, which joins every common label value and is UNBOUNDED. SNS rejects
+#     any Subject of 100 characters or more with
+#
+#         400 Invalid parameter: Subject
+#
+#     so notifications for long alert names were dropped while short ones went
+#     through. Alerting looked healthy for hours, and the alerts that were
+#     being dropped included the three whose job is to report broken delivery.
+#
+#     The delimiter hazard is settled by stating tplConfig instead of guessing
+#     at the chart default: with it explicitly false, Helm does not touch the
+#     config and the {{ }} in it are unambiguously Alertmanager's.
 am_raw = yaml.safe_dump(get("alertmanager.config") or {})
-if "{{" in am_raw:
+if "{{" in am_raw and get("alertmanager.tplConfig") is not False:
     problems.append(
-        "alertmanager.config contains '{{' — Helm's tpl and Alertmanager's templates share the "
-        "same delimiters, so this either breaks the install or is silently rewritten. "
-        "Omit the key and take Alertmanager's default instead")
+        "alertmanager.config contains '{{' but alertmanager.tplConfig is not explicitly false — "
+        "Helm's tpl and Alertmanager's templates share the same delimiters, so with tpl enabled "
+        "Helm evaluates them and the install fails. Set tplConfig: false. "
+        "Do NOT resolve this by deleting the templated keys: omitting `subject` "
+        "yields Alertmanager's UNBOUNDED default, which SNS rejects over 100 characters")
 
 if problems:
     print("observability values problems:")

@@ -136,6 +136,21 @@ prometheus:
 # Alertmanager
 # =============================================================================
 alertmanager:
+  # PINNED, not left to the chart default.
+  #
+  # This decides whether Helm runs alertmanager.config through `tpl` before
+  # writing it. It matters because Helm and Alertmanager share the `{{ }}`
+  # delimiter: with tpl on, Alertmanager's own template syntax below would be
+  # evaluated by Helm first, which fails the install with an error pointing at
+  # a values file rather than at a template.
+  #
+  # An earlier audit here dealt with that risk by DELETING the templated
+  # fields and relying on Alertmanager's defaults. That traded a loud failure
+  # for a silent one -- see the note on `subject` below. Stating the value
+  # explicitly is the fix: the templates below are then known to be
+  # Alertmanager's, and nothing depends on a chart default we never read.
+  tplConfig: false
+
   alertmanagerSpec:
     # 1Gi is not a capacity decision — Alertmanager stores the notification log
     # and silences, both of which are kilobytes. It is the EBS minimum. The
@@ -234,7 +249,32 @@ alertmanager:
               # the IRSA web identity token projected into the pod. That is the
               # whole point: no key, no SMTP password, no secret in Git.
               region: PLACEHOLDER_AWS_REGION
-            # `subject` and `message` are DELIBERATELY ABSENT.
+            # EXPLICIT AND SHORT, because SNS caps Subject at 100 CHARACTERS.
+            #
+            # This field was removed by an earlier audit, which argued that
+            # omitting it gave byte-identical notifications with no risk. The
+            # first half was true; the second was not. Alertmanager's default
+            # subject is unbounded:
+            #
+            #   [FIRING:1] AlertmanagerClusterFailedToSendAlerts vm-order
+            #   (observability/kube-prometheus-stack-prometheus critical)
+            #
+            # -- 115 characters. SNS rejects it with
+            #
+            #   400 Invalid parameter: Subject
+            #
+            # and Alertmanager gives up: "notify retry canceled due to
+            # unrecoverable error". Short alert names fitted under the cap and
+            # were delivered; long ones were silently dropped. So alerting
+            # worked for the alerts nobody minds missing, and failed for
+            # AlertmanagerClusterFailedToSendAlerts, AlertmanagerFailedToSendAlerts
+            # and AlertmanagerNotificationsFailing -- the three whose entire
+            # job is to tell you that delivery is broken.
+            #
+            # Status plus alertname only. The longest alert name in this
+            # project is 36 characters, giving a worst case of 47.
+            subject: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+            # `message` is still deliberately absent.
             #
             # AUDIT FIX. They used to be set explicitly to
             #   '{{ template "sns.default.subject" . }}'

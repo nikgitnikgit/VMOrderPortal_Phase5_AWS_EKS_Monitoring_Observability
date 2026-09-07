@@ -1835,6 +1835,9 @@ t T18.48 "every Trivy exception is scoped, justified, dated and wired in" \
 t T18.52 "every alert links to its own runbook, and that runbook exists" \
   python3 tests/check_runbook_links.py
 
+t T18.54 "the SNS subject is set and fits inside the 100-character limit" \
+  python3 tests/check_sns_subject.py
+
 t T18.49 "meta-alerts are null-routed and InfoInhibitor actually inhibits" \
   python3 tests/check_alert_routing.py
 
