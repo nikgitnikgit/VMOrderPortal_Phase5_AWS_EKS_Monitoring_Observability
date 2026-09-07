@@ -1838,6 +1838,9 @@ t T18.52 "every alert links to its own runbook, and that runbook exists" \
 t T18.54 "the SNS subject is set and fits inside the 100-character limit" \
   python3 tests/check_sns_subject.py
 
+t T18.55 "the rollback can count helm revisions (it could not, and never ran)" \
+  python3 tests/check_rollback_count.py
+
 t T18.49 "meta-alerts are null-routed and InfoInhibitor actually inhibits" \
   python3 tests/check_alert_routing.py
 

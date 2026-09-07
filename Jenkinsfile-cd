@@ -686,8 +686,27 @@ spec:
                     # by inferring it from a failure.
                     ROLLBACK_FAILED=""
                     for r in frontend worker backend; do
+                        # AUDIT FIX 3 -- THIS COUNT WAS ALWAYS 1, SO ROLLBACK NEVER RAN.
+                        #
+                        # It used to be `... -o json | grep -c '"revision"'`.
+                        # `helm history -o json` prints the ENTIRE ARRAY ON ONE
+                        # LINE, and `grep -c` counts matching LINES, not
+                        # matches. Three revisions therefore counted as 1, the
+                        # `-lt 2` test passed, and every release reported
+                        #
+                        #   frontend: no previous revision (first install)
+                        #
+                        # while the bad release kept serving. Observed on CD
+                        # build 6 against a release with three revisions.
+                        #
+                        # The comment above says a missing revision is now
+                        # established "by asking, not by inferring it from a
+                        # failure". That was the right idea; the asking was
+                        # wrong. Parse the JSON instead of pattern-counting it.
                         REVS=$(HELM_DRIVER=configmap helm history "$r" -n "$TARGET_NAMESPACE" \
-                                 -o json 2>/dev/null | grep -c '"revision"' || echo 0)
+                                 -o json 2>/dev/null \
+                                 | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))' \
+                                 2>/dev/null || echo 0)
                         if [ "${REVS:-0}" -lt 2 ]; then
                             echo "  $r: no previous revision (first install) — nothing to roll back"
                             continue
